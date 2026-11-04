@@ -30,7 +30,7 @@
 | 模块 | 功能 | 说明 |
 | --- | --- | --- |
 | **Legit — Aim Assist** | 自动瞄准 | `Lock` / `Adaptive` 两种模式，可选瞄准部位，FOV、平滑速度、距离、队伍/墙体/开镜过滤，可绘制 FOV 圈 |
-| **Legit — Combat** | Triggerbot | 准星穿过敌人时自动开火，支持反应延迟、距离、队伍与开镜限制 |
+| **Legit — Combat** | 扳机 | 准星穿过敌人时自动开火，支持反应延迟、距离、队伍与开镜限制 |
 | **Rage — RageBot** | RageBot | 直接构造 ACS 伤害请求，支持多目标、目标优先级、命中部位、多线程、连发、HitLog 与命中音效 |
 | **Visual** | 视觉反馈 | Hit Marker、命中特效、击杀特效（Valorant / Battlefield 1）、弹着点标记、散布 FOV、Arms / Character / Tool Chams、Bullet Trace |
 | **LocalPlayer** | 本地武器与移动 | Fly、Speed、Noclip、SpinBot、3rd Cam，以及 No Recoil / No Spread / Steady Aim / Infinite Ammo / Rapid Fire 等 ACS 模组修改 |
