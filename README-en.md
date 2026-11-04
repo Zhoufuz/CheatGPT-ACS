@@ -47,7 +47,7 @@
 Run this in your executor:
 
 ```Lua
-loadstring(game:HttpGet("https://", true))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Zhoufuz/CheatGPT-ACS/refs/heads/master/src/main.lua", true))()
 ```
 
 ### Requirements

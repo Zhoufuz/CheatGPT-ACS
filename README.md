@@ -46,7 +46,7 @@
 
 在你的执行器中运行运行
 ```Lua
-loadstring(game:HttpGet("https://", true))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Zhoufuz/CheatGPT-ACS/refs/heads/master/src/main.lua", true))()
 ```
 
 ### 环境要求
