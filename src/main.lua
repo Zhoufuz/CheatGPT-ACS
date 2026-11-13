@@ -8932,10 +8932,10 @@ createSlider(visualBody, "Kill Sounds Volume", 0, 5, app.KILL_SOUNDS_VOLUME, 1, 
     app.killEffect.SetVolume(value)
 end, true)
 
-createModernToggle(visualBody, "Show Impact", app.SHOW_IMPACT_ENABLED, function(v)
+app.gateExecutorToggle(createModernToggle(visualBody, "Show Impact", app.SHOW_IMPACT_ENABLED, function(v)
     app.SHOW_IMPACT_ENABLED = v
     if app.setImpactVisible then app.setImpactVisible(v) end
-end)
+end), "getsenv", "debug.getupvalues", "debug.getupvalue", "debug.setupvalue")
 app.createColorPickerRow(visualBody, "Impact Color", app.SHOW_IMPACT_COLOR, function(c)
     app.SHOW_IMPACT_COLOR = c
     if app.updateImpactMarker then app.updateImpactMarker() end
@@ -9466,6 +9466,10 @@ do
                 remoteBindings[name] = {remote = remote, connection = remote.OnClientEvent:Connect(handler)}
             end
         end
+    end
+
+    function app.getImpactCastRay(current)
+        return bridge and bridge.env == current and bridge.original or current.CastRay
     end
 
     local function restoreBridge()
@@ -11383,80 +11387,145 @@ do
     end
 end
 
--- ========== Show Impact：显示当前准星射线预计命中的地图位置 ==========
-do
-    local impactPart = Instance.new("Part")
-    impactPart.Name = app.randomName()
-    impactPart.Shape = Enum.PartType.Ball
-    impactPart.Anchored = true
-    impactPart.CanCollide = false
-    impactPart.CanTouch = false
-    impactPart.CanQuery = false
-    impactPart.CastShadow = false
-    impactPart.Transparency = 1
-    impactPart.Parent = Workspace
-
-    local impactRayParams = RaycastParams.new()
-    impactRayParams.FilterType = Enum.RaycastFilterType.Exclude
-    impactRayParams.IgnoreWater = true
-    local impactConnection = nil
-
-    function app.updateImpactMarker()
-        if not app.SHOW_IMPACT_ENABLED then
-            impactPart.Transparency = 1
-            return
-        end
-        local weapon = app.getCurrentWeapon and app.getCurrentWeapon()
-        if not weapon or not weapon:IsA("Tool") or not weapon:FindFirstChild("ACS_Settings") then
-            impactPart.Transparency = 1
-            return
-        end
-        local material = Enum.Material[app.SHOW_IMPACT_MATERIAL] or Enum.Material.Neon
-        impactPart.Color = app.SHOW_IMPACT_COLOR
-        impactPart.Material = material
-        impactPart.Size = Vector3.new(app.SHOW_IMPACT_SIZE, app.SHOW_IMPACT_SIZE, app.SHOW_IMPACT_SIZE)
-        local camera = Workspace.CurrentCamera
-        if not camera or mainGuiVisible then
-            impactPart.Transparency = 1
-            return
-        end
-        local filter = {LocalPlayer.Character, camera}
-        local acsWorkspace = Workspace:FindFirstChild("ACS_WorkSpace")
-        if acsWorkspace then filter[#filter + 1] = acsWorkspace end
-        impactRayParams.FilterDescendantsInstances = filter
-        local origin = camera.CFrame.Position
-        local result = Workspace:Raycast(origin, camera.CFrame.LookVector * 7000, impactRayParams)
-        if result then
-            impactPart.CFrame = CFrame.new(result.Position)
-            impactPart.Transparency = app.SHOW_IMPACT_TRANSPARENCY
-        else
-            impactPart.Transparency = 1
+-- Show Impact consumes native collision coordinates, never a camera prediction.
+function app.createImpactCapture(submit)
+    local control, records = {}, {}
+    local function restore(fn, record)
+        record.Active = false
+        if debug.getupvalue(fn, record.Slot) == record.Copy then
+            debug.setupvalue(fn, record.Slot, record.Original)
         end
     end
+    function control.Clear()
+        for fn, record in pairs(records) do
+            restore(fn, record)
+            records[fn] = nil
+        end
+    end
+    function control.Refresh()
+        if not app.SHOW_IMPACT_ENABLED then control.Clear(); return end
+        if type(app.collectFrameworkEnvs) ~= "function" then return end
+        local seen = {}
+        for _, e in ipairs(app.collectFrameworkEnvs()) do
+            local fn = app.getImpactCastRay and app.getImpactCastRay(e) or e.CastRay
+            if type(fn) == "function" then
+                seen[fn] = true
+                local record = records[fn]
+                if record and debug.getupvalue(fn, record.Slot) ~= record.Copy then
+                    restore(fn, record); records[fn] = nil; record = nil
+                end
+                if not record then
+                    local values = debug.getupvalues(fn)
+                    local slot, original
+                    for index = 1, #values do
+                        local value = debug.getupvalue(fn, index)
+                        if type(value) == "table" and type(rawget(value, "HitEffect")) == "function" then
+                            if slot then slot = nil; break end
+                            slot, original = index, value
+                        end
+                    end
+                    if slot then
+                        local copy = table.clone(original)
+                        record = {Slot = slot, Original = original, Copy = copy, Active = true}
+                        local captured = record
+                        local native = original.HitEffect
+                        copy.HitEffect = function(...)
+                            local _, position = ...
+                            -- Game threads only enqueue values; Instance work runs on our Heartbeat.
+                            if captured.Active then submit(position) end
+                            return native(...)
+                        end
+                        records[fn] = record
+                        debug.setupvalue(fn, slot, copy)
+                    end
+                end
+            end
+        end
+        for fn, record in pairs(records) do
+            if not seen[fn] then restore(fn, record); records[fn] = nil end
+        end
+    end
+    return control
+end
 
+do
+    local markers, pending = {}, {}
+    local stopped, elapsed = false, 0.5
+    local lifetime, limit = 3, 32
+    local function clear()
+        table.clear(pending)
+        for _, record in ipairs(markers) do record.Part:Destroy() end
+        table.clear(markers)
+    end
+    function app.recordImpact(position)
+        if stopped or not app.SHOW_IMPACT_ENABLED or typeof(position) ~= "Vector3" then return end
+        if position.X ~= position.X or position.Y ~= position.Y or position.Z ~= position.Z
+            or math.abs(position.X) == math.huge or math.abs(position.Y) == math.huge
+            or math.abs(position.Z) == math.huge then return end
+        if #pending >= limit then table.remove(pending, 1) end
+        pending[#pending + 1] = {Position = position, At = os.clock()}
+    end
+    local capture = app.createImpactCapture(app.recordImpact)
+    local function style(part)
+        part.Color = app.SHOW_IMPACT_COLOR
+        part.Material = Enum.Material[app.SHOW_IMPACT_MATERIAL] or Enum.Material.Neon
+        part.Size = Vector3.new(app.SHOW_IMPACT_SIZE, app.SHOW_IMPACT_SIZE, app.SHOW_IMPACT_SIZE)
+        part.Transparency = app.SHOW_IMPACT_TRANSPARENCY
+    end
+    function app.updateImpactMarker()
+        if not app.SHOW_IMPACT_ENABLED then clear(); return end
+        for _, record in ipairs(markers) do style(record.Part) end
+    end
     function app.setImpactVisible(enabled)
         app.SHOW_IMPACT_ENABLED = enabled == true
-        if app.SHOW_IMPACT_ENABLED then
-            if not impactConnection then
-                impactConnection = RunService.RenderStepped:Connect(function()
-                    app.xpcallw(app.updateImpactMarker, "Show Impact")
-                end)
-            end
-            app.updateImpactMarker()
-        else
-            if impactConnection then
-                impactConnection:Disconnect()
-                impactConnection = nil
-            end
-            impactPart.Transparency = 1
-        end
+        if not app.SHOW_IMPACT_ENABLED then clear() end
+        app.xpcallw(capture.Refresh, "Show Impact capture")
     end
-
-    gui.Destroying:Connect(function()
-        if impactConnection then impactConnection:Disconnect(); impactConnection = nil end
-        impactPart:Destroy()
+    local heartbeat = RunService.Heartbeat:Connect(function(dt)
+        if stopped or not app.SHOW_IMPACT_ENABLED then return end
+        app.xpcallw(function()
+            elapsed += dt
+            if elapsed >= 0.5 then
+                elapsed = 0
+                app.xpcallw(capture.Refresh, "Show Impact capture")
+            end
+            local now = os.clock()
+            for index = #markers, 1, -1 do
+                if now - markers[index].At >= lifetime then
+                    markers[index].Part:Destroy()
+                    table.remove(markers, index)
+                end
+            end
+            for _, hit in ipairs(pending) do
+                if now - hit.At < lifetime then
+                    if #markers >= limit then table.remove(markers, 1).Part:Destroy() end
+                    local part = Instance.new("Part")
+                    part.Name = app.randomName()
+                    part.Shape = Enum.PartType.Ball
+                    part.Anchored = true
+                    part.CanCollide, part.CanTouch, part.CanQuery = false, false, false
+                    part.CastShadow = false
+                    part.CFrame = CFrame.new(hit.Position)
+                    style(part)
+                    part.Parent = Workspace
+                    markers[#markers + 1] = {Part = part, At = hit.At}
+                end
+            end
+            table.clear(pending)
+        end, "Show Impact")
     end)
-
+    local characterAdded = LocalPlayer.CharacterAdded:Connect(function()
+        clear()
+        elapsed = 0.5
+        app.xpcallw(capture.Clear, "Show Impact reset")
+    end)
+    gui.Destroying:Connect(function()
+        stopped = true
+        heartbeat:Disconnect()
+        characterAdded:Disconnect()
+        clear()
+        app.xpcallw(capture.Clear, "Show Impact restore")
+    end)
     app.setImpactVisible(app.SHOW_IMPACT_ENABLED)
 end
 
@@ -13601,6 +13670,7 @@ function app.doInstantHit(part, showTrace, launchOrigin, launchDirection, camera
 
     -- 轨迹描述已经发生的射击，不依赖 Damage 的返回值，拒绝命中也不应吞掉 Self 轨迹。
     if showTrace then app.createForwardBeamToPoint(origin, hitPos) end
+    if app.recordImpact then app.recordImpact(hitPos) end
 
     -- 冲击特效(与原版一致转发服务器,其他玩家也能看到血花/火花)
     app.xpcallw(function()
