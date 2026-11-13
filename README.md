@@ -119,6 +119,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Zhoufuz/CheatGPT-ACS/
   - `Fly` + `Fly Speed`（1–100，默认 1）：相机朝向飞行。
   - `Speed` + `Speed Value`（0–80）：修改移动速度。
   - `Noclip`：关闭角色碰撞。
+  - `No Fall Dmg`：开启后免疫 ACS 掉落伤害，关闭后恢复；默认关闭，支持保存配置，重生后自动重新应用。需要下方 API 表中列出的执行器接口。
   - ACS 武器增强（**均需要执行器支持相应调试/挂钩 API**）：
   - `No Suppression`：移除压制/耳鸣等负面效果。
   - `No Malfunction`：武器不会卡壳。
@@ -191,7 +192,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Zhoufuz/CheatGPT-ACS/
 | `getsenv` | 读取 ACS 环境 | **必要**：缺失脚本无法运行 |
 | `debug.getupvalues` / `debug.getupvalue` / `debug.setupvalue` | 读写 ACS 武器模组 | 大部分 ACS 增强开关禁用 |
 | `hookfunction` / `newcclosure` | 挂钩 ACS 函数 | `Rapid Fire`、`Instant Equip`、`Steady Aim` 等禁用 |
-| `getconnections` / `getgc` / `getfenv` / `debug.getconstants` | 定位渲染连接 | `Steady Aim` 禁用 |
+| `getconnections` / `getgc` / `getfenv` / `debug.getconstants` | 定位 ACS 渲染与角色状态回调 | `Steady Aim`、`No Fall Dmg` 禁用 |
 | `writefile` / `readfile` | 保存配置、写入资源缓存 | 配置不保存；资源无法缓存 |
 | `getcustomasset` / `getsynasset` | 注册本地资源 URI | 图标/音效/击杀特效/字体不可用 |
 | `request` / `http_request` / `syn.request` / `http.request` | 下载资源 | 回退到 `game:HttpGet` |
@@ -206,6 +207,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Zhoufuz/CheatGPT-ACS/
 | 功能 | 需要的 API |
 | --- | --- |
 | `Trigger` | `getsenv` |
+| `No Fall Dmg` | `getconnections` 或 `getgc`、`getfenv`、`debug.getconstants`、`debug.getupvalues`、`debug.getupvalue`、`debug.setupvalue` |
 | `RageBot`、`No Malfunction`、`No Recoil`、`No Spread`、`Accelerate Muzzle Velocity` | `getsenv` + `debug.getupvalues` |
 | `Rapid Fire` | `getsenv`、`hookfunction`、`newcclosure`、`getcallingscript`、`debug.getupvalues`、`debug.setupvalue` |
 | `Infinite Ammo` | `getsenv`、`debug.getupvalues`、`debug.setupvalue` |

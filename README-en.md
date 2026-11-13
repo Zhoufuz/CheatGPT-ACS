@@ -120,6 +120,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Zhoufuz/CheatGPT-ACS/
   - `Fly` + `Fly Speed` (1–100, default 1): fly in the direction of the camera.
   - `Speed` + `Speed Value` (0–80): modify movement speed.
   - `Noclip`: disable character collision.
+  - `No Fall Dmg`: prevents ACS fall damage while enabled and restores it when disabled. Off by default; saved in the config and automatically reapplied after respawning. Requires the executor APIs listed below.
   - ACS weapon enhancements (**all require the corresponding executor debug/hook APIs**):
   - `No Suppression`: removes suppression/tinnitus and other negative effects.
   - `No Malfunction`: the weapon never jams.
@@ -192,7 +193,7 @@ The script detects executor capabilities at startup and enables/disables feature
 | `getsenv` | Read the ACS environment | **Required**: the script cannot run |
 | `debug.getupvalues` / `debug.getupvalue` / `debug.setupvalue` | Read/write ACS weapon mods | Most ACS enhancement toggles are disabled |
 | `hookfunction` / `newcclosure` | Hook ACS functions | `Rapid Fire`, `Instant Equip`, `Steady Aim`, etc. are disabled |
-| `getconnections` / `getgc` / `getfenv` / `debug.getconstants` | Locate render connections | `Steady Aim` is disabled |
+| `getconnections` / `getgc` / `getfenv` / `debug.getconstants` | Locate ACS render and character-state callbacks | `Steady Aim` and `No Fall Dmg` are disabled |
 | `writefile` / `readfile` | Save config, write asset cache | Config is not saved; assets cannot be cached |
 | `getcustomasset` / `getsynasset` | Register local asset URIs | Icons/sounds/kill effects/font are unavailable |
 | `request` / `http_request` / `syn.request` / `http.request` | Download assets | Falls back to `game:HttpGet` |
@@ -207,6 +208,7 @@ The script detects executor capabilities at startup and enables/disables feature
 | Feature | Required APIs |
 | --- | --- |
 | `Trigger` | `getsenv` |
+| `No Fall Dmg` | `getconnections` or `getgc`, `getfenv`, `debug.getconstants`, `debug.getupvalues`, `debug.getupvalue`, `debug.setupvalue` |
 | `RageBot`, `No Malfunction`, `No Recoil`, `No Spread`, `Accelerate Muzzle Velocity` | `getsenv` + `debug.getupvalues` |
 | `Rapid Fire` | `getsenv`, `hookfunction`, `newcclosure`, `getcallingscript`, `debug.getupvalues`, `debug.setupvalue` |
 | `Infinite Ammo` | `getsenv`, `debug.getupvalues`, `debug.setupvalue` |
