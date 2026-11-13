@@ -992,6 +992,7 @@ local teamCheckEnabled = true
 -- No Recoil / No Spread
 local noRecoilEnabled = false
 local noSpreadEnabled = false
+app.NO_FALL_DMG = false
 app.NO_SUPPRESSION = false
 app.NO_MALFUNCTION = false
 app.STEADY_AIM = false
@@ -1475,6 +1476,7 @@ function app.collectCheatGPTConfig()
         HITMARKER_MODE = app.HITMARKER_MODE, HITMARKER_ENABLED = app.HITMARKER_ENABLED,
         KILL_EFFECT_ENABLED = app.KILL_EFFECT_ENABLED, KILL_EFFECT_STYLE = app.KILL_EFFECT_STYLE, KILL_SOUNDS_VOLUME = app.KILL_SOUNDS_VOLUME,
         KILL_EFFECT_COLLECTION = app.KILL_EFFECT_COLLECTION,
+        NO_FALL_DMG = app.NO_FALL_DMG,
         NO_SUPPRESSION = app.NO_SUPPRESSION, NO_MALFUNCTION = app.NO_MALFUNCTION, STEADY_AIM = app.STEADY_AIM,
         HIT_EFFECT_ENABLED = app.HIT_EFFECT_ENABLED, HIT_EFFECT_COLOR = app.colorToConfig(app.HIT_EFFECT_COLOR),
         HIT_EFFECT_TRANSPARENCY = app.HIT_EFFECT_TRANSPARENCY,
@@ -1662,6 +1664,7 @@ function app.applyLoadedCheatGPTConfig()
     teamCheckEnabled = app.configBoolean("teamCheckEnabled", teamCheckEnabled)
     noRecoilEnabled = app.configBoolean("noRecoilEnabled", noRecoilEnabled)
     noSpreadEnabled = app.configBoolean("noSpreadEnabled", noSpreadEnabled)
+    app.NO_FALL_DMG = app.configBoolean("NO_FALL_DMG", false)
     app.NO_SUPPRESSION = app.configBoolean("NO_SUPPRESSION", false)
     app.NO_MALFUNCTION = app.configBoolean("NO_MALFUNCTION", false)
     app.STEADY_AIM = app.configBoolean("STEADY_AIM", false)
@@ -3407,6 +3410,7 @@ do
             ["RageBot"] = "rageEnabled", ["Only Enemy"] = "onlyEnemyEnabled", ["Team Check"] = "teamCheckEnabled",
             ["WallBang"] = "WALLBANG", ["HitLog"] = "hitLogEnabled", ["Hitsounds"] = "HITSOUND_ENABLED",
             ["Kill effect"] = "KILL_EFFECT_ENABLED",
+            ["No Fall Dmg"] = "NO_FALL_DMG",
             ["No Suppression"] = "NO_SUPPRESSION", ["No Malfunction"] = "NO_MALFUNCTION", ["Steady Aim"] = "STEADY_AIM",
             ["Hit Marker"] = "HITMARKER_ENABLED", ["Hit effect"] = "HIT_EFFECT_ENABLED", ["Show Impact"] = "SHOW_IMPACT_ENABLED",
             ["Spread FOV"] = "SPREAD_FOV_ENABLED",
@@ -9703,6 +9707,90 @@ do
     end, "Noclip")
 end
 
+-- Keep ACS Freefall/Landed bookkeeping alive, including a fall already in
+-- progress. Only its damage multiplier is overridden; shared settings stay intact.
+function app.createFallDamageGuard()
+    local control, records = {}, {}
+    local stopped, nextScan, lastScope = false, 0, nil
+    local function restore(fn, record)
+        if debug.getupvalue(fn, record.Slot) == record.Copy then
+            debug.setupvalue(fn, record.Slot, record.Original)
+        end
+    end
+    function control.Clear()
+        for fn, record in pairs(records) do
+            restore(fn, record)
+            records[fn] = nil
+        end
+    end
+    local function inspect(fn, scope)
+        if type(fn) ~= "function" or records[fn] then return end
+        local envOK, e = pcall(getfenv, fn)
+        if not envOK or type(e) ~= "table" or typeof(e.script) ~= "Instance"
+            or not e.script:IsDescendantOf(scope) then return end
+        local constantsOK, constants = pcall(debug.getconstants, fn)
+        if not constantsOK or type(constants) ~= "table" then return end
+        local names = {}
+        for _, value in pairs(constants) do
+            if type(value) == "string" then names[value] = true end
+        end
+        if not (names.EnableFallDamage and names.MaxVelocity and names.DamageMult
+            and names.Freefall and names.Landed and names.FallDamage and names.InvokeServer) then return end
+        -- Use indexed reads: some executors enumerate getupvalues out of order.
+        local values = debug.getupvalues(fn)
+        local slot, original
+        for index = 1, #values do
+            local value = debug.getupvalue(fn, index)
+            if type(value) == "table" and type(value.EnableFallDamage) == "boolean"
+                and type(value.MaxVelocity) == "number" and type(value.DamageMult) == "number" then
+                if slot then return end -- ambiguous callback: do not guess
+                slot, original = index, value
+            end
+        end
+        if not slot then return end
+        local copy = setmetatable({DamageMult = 0}, {__index = original})
+        local record = {Slot = slot, Original = original, Copy = copy, Script = e.script}
+        records[fn] = record -- retain restoration data even if the executor throws
+        debug.setupvalue(fn, slot, copy)
+    end
+    function control.Refresh()
+        if stopped then return end
+        if not app.NO_FALL_DMG then control.Clear(); return end
+        local character = LocalPlayer.Character
+        local scope = character and character:FindFirstChild("ACS_Client")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if scope ~= lastScope then lastScope, nextScan = scope, 0 end
+        for fn, record in pairs(records) do
+            if not scope or not record.Script:IsDescendantOf(scope)
+                or debug.getupvalue(fn, record.Slot) ~= record.Copy then
+                restore(fn, record)
+                records[fn] = nil
+            end
+        end
+        if not scope or not humanoid then return end
+        if type(getconnections) == "function" then
+            local ok, connections = pcall(getconnections, humanoid.StateChanged)
+            if ok and type(connections) == "table" then
+                for _, connection in ipairs(connections) do
+                    local readable, fn = pcall(function() return connection.Function end)
+                    if readable then inspect(fn, scope) end
+                end
+            end
+        end
+        -- Delta may hide connection.Function; scan only until a matching callback
+        -- is found, and only within this character's ACS scripts.
+        if next(records) == nil and type(getgc) == "function" and os.clock() >= nextScan then
+            nextScan = os.clock() + 5
+            for _, fn in ipairs(getgc(false)) do inspect(fn, scope) end
+        end
+    end
+    function control.Destroy()
+        stopped = true
+        control.Clear()
+    end
+    return control
+end
+
 -- Only the native ACS overlays and ringing are muted. Outgoing suppression
 -- events (including Battlefield suppression assists) are left intact.
 function app.createSuppressionGuard()
@@ -10094,10 +10182,15 @@ function app.createLocalWeaponOptions()
 end
 
 do
+    local fallDamage = app.createFallDamageGuard()
     local suppression = app.createSuppressionGuard()
     local weapons = app.createLocalWeaponOptions()
     local steady = app.createSteadyAimController()
     app.refreshSteadyAim = steady.Refresh
+    app.gateExecutorToggle(createModernToggle(localBody, "No Fall Dmg", app.NO_FALL_DMG, function(value)
+        app.NO_FALL_DMG = value
+        app.xpcallw(fallDamage.Refresh, "No Fall Dmg")
+    end), "getconnections/getgc", "getfenv", "debug.getconstants", "debug.getupvalues", "debug.getupvalue", "debug.setupvalue")
     createModernToggle(localBody, "No Suppression", app.NO_SUPPRESSION, function(value)
         app.NO_SUPPRESSION = value
         suppression.Set(value)
@@ -10117,12 +10210,14 @@ do
         elapsed += dt
         if elapsed < 0.5 then return end
         elapsed = 0
+        app.xpcallw(fallDamage.Refresh, "No Fall Dmg")
         app.xpcallw(suppression.Refresh, "No Suppression")
         app.xpcallw(weapons.Refresh, "Local weapon options")
         app.xpcallw(steady.Refresh, "Steady Aim")
     end)
     gui.Destroying:Connect(function()
         heartbeat:Disconnect()
+        fallDamage.Destroy()
         suppression.Destroy()
         weapons.Destroy()
         steady.Destroy()
