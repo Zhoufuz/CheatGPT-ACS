@@ -1062,7 +1062,9 @@ local spinSpeed = 20
 app.CHEATGPT_ROOT_DIR = "CheatGPT"
 app.CHEATGPT_ACS_DIR = "CheatGPT/ACS"
 app.CHEATGPT_CACHE_DIR = "CheatGPT/ACS/Cache"
-app.CHEATGPT_CONFIG_PATH = "CheatGPT/ACS/Config.json"
+app.CHEATGPT_CONFIG_PATH = "CheatGPT/ACS/Config.yaml"
+app.CHEATGPT_LEGACY_CONFIG_PATH = "CheatGPT/ACS/Config.json"
+app.CONFIG_WRITE_BLOCKED = false
 app.CHEATGPT_WHITELIST_PATH = "CheatGPT/ACS/whitelist.json"
 app.CHEATGPT_ENEMYLIST_PATH = "CheatGPT/ACS/enemylist.json"
 app.CONFIG_VALUES = {}
@@ -1112,7 +1114,219 @@ function app.writeCheatGPTJson(path, value)
     return okWrite
 end
 
--- Lifetime totals are deliberately outside Config.json and life/feedback resets.
+-- Data-only YAML: block maps/sequences, flow collections, quoted/plain scalars.
+-- No executable tags, anchors or aliases; malformed files must never be autosaved over.
+do
+    local function trim(text) return text:match("^%s*(.-)%s*$") end
+    -- Locate a delimiter outside quotes/flow collections, or strip an inline comment.
+    local function delimiter(text, wanted)
+        local quote, depth, index = nil, 0, 1
+        while index <= #text do
+            local c = text:sub(index, index)
+            if quote then
+                if quote == '"' and c == "\\" then index += 1
+                elseif c == quote then
+                    if quote == "'" and text:sub(index + 1, index + 1) == "'" then index += 1
+                    else quote = nil end
+                end
+            elseif c == '"' or c == "'" then quote = c
+            elseif c == "#" and (index == 1 or text:sub(index - 1, index - 1):match("%s")) then
+                if wanted == "#" then return index end
+                error("Unexpected YAML comment")
+            elseif wanted ~= "#" and c == wanted and depth == 0 then return index
+            elseif c == "[" or c == "{" then depth += 1
+            elseif c == "]" or c == "}" then depth -= 1; assert(depth >= 0, "Unbalanced YAML collection") end
+            index += 1
+        end
+        assert(not quote and depth == 0, "Unterminated YAML quote or collection")
+        return nil
+    end
+    local function key(text)
+        text = trim(text)
+        if text:sub(1,1) == '"' then
+            local decoded = game:GetService("HttpService"):JSONDecode(text)
+            assert(type(decoded) == "string", "YAML keys must be strings")
+            return decoded
+        elseif text:sub(1,1) == "'" then
+            assert(text:sub(-1) == "'", "Unterminated YAML key")
+            assert(not text:sub(2,-2):gsub("''", ""):find("'", 1, true), "Invalid YAML key quote")
+            return (text:sub(2,-2):gsub("''", "'"))
+        end
+        assert(text:match("^[%w_][%w_.%-]*$") and not tonumber(text), "Quote this YAML key: " .. text)
+        return text
+    end
+    local scalar
+    scalar = function(text, depth)
+        assert(depth <= 32, "YAML nesting is too deep")
+        text = trim(text)
+        local first, last = text:sub(1,1), text:sub(-1)
+        if first == '"' then
+            local value = game:GetService("HttpService"):JSONDecode(text)
+            assert(type(value) == "string", "Invalid YAML string")
+            return value
+        elseif first == "'" then
+            assert(last == "'", "Unterminated YAML string")
+            assert(not text:sub(2,-2):gsub("''", ""):find("'", 1, true), "Invalid YAML string quote")
+            return (text:sub(2,-2):gsub("''", "'"))
+        elseif first == "[" or first == "{" then
+            assert(last == (first == "[" and "]" or "}"), "Unterminated YAML collection")
+            local body, result = trim(text:sub(2,-2)), {}
+            while body ~= "" do
+                local comma = delimiter(body, ",")
+                local entry = trim(comma and body:sub(1, comma - 1) or body)
+                if first == "[" then
+                    result[#result + 1] = scalar(entry, depth + 1)
+                else
+                    local colon = delimiter(entry, ":")
+                    assert(colon, "Missing YAML map colon")
+                    local name = key(entry:sub(1, colon - 1))
+                    assert(result[name] == nil, "Duplicate YAML key: " .. name)
+                    result[name] = scalar(entry:sub(colon + 1), depth + 1)
+                end
+                body = comma and trim(body:sub(comma + 1)) or ""
+            end
+            return result
+        elseif text:lower() == "true" then return true
+        elseif text:lower() == "false" then return false end
+        local number = tonumber(text)
+        if number then
+            assert(number == number and math.abs(number) < math.huge, "Non-finite YAML number")
+            return number
+        end
+        assert(text ~= "" and text ~= "~" and text:lower() ~= "null"
+            and text:lower() ~= ".nan" and not text:lower():match("^[+-]?%.inf$")
+            and not first:match("[&*!|>@%%]"), "Unsupported YAML scalar: " .. text)
+        return text
+    end
+    function app.decodeConfigYaml(text)
+        assert(type(text) == "string" and #text <= 1048576, "Configuration exceeds 1 MiB")
+        text = text:gsub("^\239\187\191", ""):gsub("\r\n", "\n")
+        local lines = {}
+        for line in (text .. "\n"):gmatch("(.-)\n") do
+            local indent, content = line:match("^(%s*)(.-)%s*$")
+            assert(not indent:find("\t", 1, true), "Use spaces for YAML indentation")
+            local comment = delimiter(content, "#")
+            if comment then content = trim(content:sub(1, comment - 1)) end
+            if content ~= "" then
+                if content == "---" then assert(#lines == 0, "Multiple YAML documents are unsupported")
+                else lines[#lines + 1] = {Indent = #indent, Text = content} end
+            end
+        end
+        assert(#lines > 0 and #lines <= 20000 and lines[1].Indent == 0, "Invalid YAML root")
+        local cursor = 1
+        local parseBlock
+        parseBlock = function(indent, depth)
+            assert(depth <= 32, "YAML nesting is too deep")
+            local result, sequence = {}, nil
+            while cursor <= #lines and lines[cursor].Indent >= indent do
+                local line = lines[cursor]
+                assert(line.Indent == indent, "Unexpected YAML indentation at entry " .. cursor)
+                local item = line.Text == "-" or line.Text:sub(1,2) == "- "
+                if sequence == nil then sequence = item end
+                assert(sequence == item, "Cannot mix YAML maps and sequences")
+                local name, rest
+                if item then name, rest = #result + 1, trim(line.Text:sub(2))
+                else
+                    local colon = delimiter(line.Text, ":")
+                    assert(colon, "Missing YAML map colon at entry " .. cursor)
+                    name, rest = key(line.Text:sub(1, colon - 1)), trim(line.Text:sub(colon + 1))
+                    assert(result[name] == nil, "Duplicate YAML key: " .. name)
+                end
+                cursor += 1
+                if rest == "" then
+                    assert(lines[cursor] and lines[cursor].Indent > indent, "Missing YAML value")
+                    result[name] = parseBlock(lines[cursor].Indent, depth + 1)
+                else result[name] = scalar(rest, depth + 1) end
+            end
+            return result
+        end
+        return parseBlock(0, 0)
+    end
+    function app.encodeConfigYaml(config)
+        local lines, visiting = {"# CheatGPT ACS configuration"}, {}
+        local function atom(value)
+            local kind = type(value)
+            if kind == "string" then return game:GetService("HttpService"):JSONEncode(value)
+            elseif kind == "boolean" then return tostring(value)
+            elseif kind == "number" then
+                assert(value == value and math.abs(value) < math.huge, "Non-finite config number")
+                return string.format("%.17g", value)
+            end
+            error("Unsupported config value: " .. kind)
+        end
+        local emit
+        emit = function(value, indent, depth)
+            assert(depth <= 32 and not visiting[value], "Cyclic or deeply nested configuration")
+            visiting[value] = true
+            local keys, count, sequence = {}, 0, true
+            for name in pairs(value) do
+                count += 1
+                keys[#keys + 1] = name
+                if type(name) ~= "number" or name < 1 or name % 1 ~= 0 then sequence = false end
+            end
+            if sequence then assert(count == #value, "Sparse configuration sequence")
+            else
+                for _, name in ipairs(keys) do assert(type(name) == "string", "Mixed configuration keys") end
+            end
+            table.sort(keys)
+            for _, name in ipairs(keys) do
+                local entry = value[name]
+                local reserved = not sequence and ({yes=true, no=true, on=true, off=true,
+                    ["true"]=true, ["false"]=true, null=true})[name:lower()]
+                local label = sequence and "-" or (not reserved and name:match("^[%a_][%w_]*$") and name or atom(name)) .. ":"
+                local prefix = string.rep(" ", indent) .. label
+                if type(entry) == "table" and next(entry) ~= nil then
+                    lines[#lines + 1] = prefix
+                    emit(entry, indent + 2, depth + 1)
+                else lines[#lines + 1] = prefix .. " " .. (type(entry) == "table" and "{}" or atom(entry)) end
+            end
+            visiting[value] = nil
+        end
+        emit(config, 0, 0)
+        return table.concat(lines, "\n") .. "\n"
+    end
+    function app.validateConfigDocument(config)
+        assert(type(config) == "table" and type(config.values) == "table", "Missing configuration values")
+        assert(config.version == nil or config.version == 1 or config.version == 2, "Unsupported configuration version")
+        for name in pairs(config.values) do assert(type(name) == "string", "Configuration values must be a map") end
+        return config
+    end
+    function app.writeCheatGPTYaml(config)
+        assert(type(writefile) == "function" and type(readfile) == "function", "Config.yaml requires writefile and readfile")
+        app.ensureCheatGPTAcsStorage()
+        app.validateConfigDocument(config)
+        local text = app.encodeConfigYaml(config)
+        assert(#text <= 1048576, "Configuration exceeds 1 MiB")
+        app.validateConfigDocument(app.decodeConfigYaml(text))
+        writefile(app.CHEATGPT_CONFIG_PATH, text)
+        local verified = app.validateConfigDocument(app.decodeConfigYaml(readfile(app.CHEATGPT_CONFIG_PATH)))
+        assert(app.encodeConfigYaml(verified) == text, "Config.yaml write verification failed")
+        return true
+    end
+    local function readExisting(path)
+        if type(isfile) == "function" then
+            if not isfile(path) then return nil end
+            return readfile(path) -- an existing unreadable file is not treated as absent
+        end
+        local ok, text = pcall(readfile, path)
+        if ok then return text end
+        error("Cannot safely detect existing configuration without isfile: " .. tostring(text))
+    end
+    function app.readOrMigrateCheatGPTConfig()
+        if type(readfile) ~= "function" then return nil end
+        local text = readExisting(app.CHEATGPT_CONFIG_PATH)
+        if text ~= nil then return app.validateConfigDocument(app.decodeConfigYaml(text)) end
+        text = readExisting(app.CHEATGPT_LEGACY_CONFIG_PATH)
+        if text == nil then return nil end
+        local config = app.validateConfigDocument(game:GetService("HttpService"):JSONDecode(text))
+        config.version = 2
+        -- Keep the source JSON intact; failed writes can retry without losing settings.
+        app.xpcallw(function() app.writeCheatGPTYaml(config) end, "Migrate Config.json to Config.yaml")
+        return config
+    end
+end
+
+-- Lifetime totals are deliberately outside Config.yaml and life/feedback resets.
 function app.createLifetimeStats()
     local path = "CheatGPT/ACS/misc.json"
     local stats = {Kills = 0, Score = 0}
@@ -1517,7 +1731,7 @@ function app.collectCheatGPTConfig()
         TRACE_SELF_TRANSPARENCY = app.TRACE_SELF_TRANSPARENCY, TRACE_OTHERS_TRANSPARENCY = app.TRACE_OTHERS_TRANSPARENCY,
     }
     for key, value in pairs(app.CONFIG_EXTRA) do values[key] = value end
-    return {version = 1, values = values}
+    return {version = 2, values = values}
 end
 
 -- 配置保存与删除共用忙状态，避免执行器文件 API 让出线程时交叉写回。
@@ -1525,11 +1739,12 @@ do
     local fileBusy = false
 
     function app.saveCheatGPTConfig()
+        if app.CONFIG_WRITE_BLOCKED then return false, "invalid configuration" end
         if fileBusy then return false, "busy" end
         fileBusy = true
         local ok = app.xpcallw(function()
             if not app.CONFIG_FILE_DELETED then
-                app.writeCheatGPTJson(app.CHEATGPT_CONFIG_PATH, app.collectCheatGPTConfig())
+                app.writeCheatGPTYaml(app.collectCheatGPTConfig())
             end
             app.saveCheatGPTLists()
         end, "Save configuration")
@@ -1544,14 +1759,15 @@ do
         end
         fileBusy = true
         local ok, err = pcall(function()
-            if isfile(app.CHEATGPT_CONFIG_PATH) then
-                delfile(app.CHEATGPT_CONFIG_PATH)
+            for _, path in ipairs({app.CHEATGPT_LEGACY_CONFIG_PATH, app.CHEATGPT_CONFIG_PATH}) do
+                if isfile(path) then delfile(path) end
+                assert(not isfile(path), "The configuration file still exists after deletion: " .. path)
             end
-            assert(not isfile(app.CHEATGPT_CONFIG_PATH), "The configuration file still exists after deletion")
         end)
         if ok then
             -- 旧的延迟保存只继续保存名单；下一次明确修改设置才允许重建配置。
             app.CONFIG_FILE_DELETED = true
+            app.CONFIG_WRITE_BLOCKED = false
         end
         fileBusy = false
         if not ok then
@@ -1702,9 +1918,13 @@ end
 
 function app.loadCheatGPTState()
     app.ensureCheatGPTAcsStorage()
-    local config = app.readCheatGPTJson(app.CHEATGPT_CONFIG_PATH)
-    if config and type(config.values) == "table" then
+    local loaded, config = app.xpcallw(app.readOrMigrateCheatGPTConfig, "Load configuration (file preserved on error)")
+    app.CONFIG_WRITE_BLOCKED = not loaded
+    if loaded and config and type(config.values) == "table" then
         app.CONFIG_VALUES = config.values
+        for name, value in pairs(config.values) do
+            if app.DEFAULT_CONFIG[name] == nil then app.CONFIG_EXTRA[name] = value end
+        end
         app.applyLoadedCheatGPTConfig()
     end
     local whitelist = app.readCheatGPTJson(app.CHEATGPT_WHITELIST_PATH)
@@ -3393,7 +3613,7 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 end)
 
--- 控件重置注册表：默认值来自读取 Config.json 之前的快照。
+-- 控件重置注册表：默认值来自读取 Config.yaml 之前的快照。
 app.CONFIG_CONTROLS = {}
 function app.copyConfigValue(value)
     if type(value) ~= "table" then return value end
