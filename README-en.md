@@ -169,7 +169,8 @@ The script creates a `CheatGPT/ACS/` directory in the executor's working directo
 
 | Path | Content |
 | --- | --- |
-| `CheatGPT/ACS/Config.json` | Configuration file |
+| `CheatGPT/ACS/Config.yaml` | Current main configuration (YAML, version 2) |
+| `CheatGPT/ACS/Config.json` | Legacy main configuration used for automatic migration; retained afterward |
 | `CheatGPT/ACS/whitelist.json` | Friend list |
 | `CheatGPT/ACS/enemylist.json` | Enemy list |
 | `CheatGPT/ACS/misc.json` | Lifetime kills and score |
@@ -177,7 +178,9 @@ The script creates a `CheatGPT/ACS/` directory in the executor's working directo
 | `CheatGPT/ACS/Cache/` | Cached icons, sounds, kill-effect frames, font, etc. |
 
 - **Auto-save**: changes are written after **4 seconds**.
-- **Clear config**: `Clear Config` deletes `Config.json`.
+- **Automatic legacy migration**: startup reads `Config.yaml` first. If only the legacy `Config.json` exists, it is automatically converted to YAML and read back for verification, preserving the settings and original JSON file. No manual conversion is needed. Subsequent saves write to `Config.yaml`.
+- **Damaged-file protection**: if configuration reading or parsing fails, auto-save is paused to avoid overwriting the original file. Fix the file and rerun the script, or use `Clear Config` to restore defaults.
+- **Clear config**: `Clear Config` deletes both `Config.yaml` and the legacy `Config.json`, preventing old settings from being migrated again on the next launch.
 - If the executor does not support `writefile` / `readfile`, the configuration will not be saved.
 
 <a id="executor-compat"></a>
@@ -258,13 +261,13 @@ These assets require an internet download and an executor that supports `writefi
 <details>
 <summary><b>Settings are not saved?</b></summary>
 
-The configuration is written to `CheatGPT/ACS/Config.json`, and the executor must support `writefile` / `readfile`; make sure the executor allows file access and check whether the `CheatGPT/ACS/` directory exists. Without file permissions the configuration will not be saved.
+The configuration is written to `CheatGPT/ACS/Config.yaml`, and the executor must support `writefile` / `readfile`; make sure the executor allows file access and check whether the `CheatGPT/ACS/` directory exists. The legacy `Config.json` is retained after migration and is no longer updated when settings change. A configuration parsing error preserves the original file and pauses auto-save; fix the file and rerun the script, or clear the configuration to restore defaults.
 </details>
 
 <details>
 <summary><b>How do I restore the default settings?</b></summary>
 
-Open Setting → `Clear Config` → `Clear and Reset`. This deletes `Config.json` and resets all controls, but keeps the Friend/Enemy lists and the asset cache.
+Open Setting → `Clear Config` → `Clear and Reset`. This deletes both `Config.yaml` and the legacy `Config.json` and resets all controls, while keeping the Friend/Enemy lists, lifetime kills and score, and the asset cache.
 </details>
 
 <details>

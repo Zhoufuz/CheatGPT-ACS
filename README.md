@@ -168,7 +168,8 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Zhoufuz/CheatGPT-ACS/
 
 | 路径 | 内容 |
 | --- | --- |
-| `CheatGPT/ACS/Config.json` | 配置文件|
+| `CheatGPT/ACS/Config.yaml` | 当前主配置文件（YAML，版本 2） |
+| `CheatGPT/ACS/Config.json` | 旧版主配置，仅用于自动迁移；迁移后保留原文件 |
 | `CheatGPT/ACS/whitelist.json` | Friend 名单 |
 | `CheatGPT/ACS/enemylist.json` | Enemy 名单 |
 | `CheatGPT/ACS/misc.json` | 累计击杀数和分数 |
@@ -176,7 +177,9 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Zhoufuz/CheatGPT-ACS/
 | `CheatGPT/ACS/Cache/` | 图标、音效、击杀特效帧、字体等缓存文件 |
 
 - **自动保存**：变更后 **4 秒** 写入
-- **清除配置**：`Clear Config` 删除 `Config.json`
+- **旧版自动转换**：启动时优先读取 `Config.yaml`。若只有旧版 `Config.json`，会自动转换为 YAML 并读回校验，保留原有设置和原 JSON 文件，无需手动转换。后续保存写入 `Config.yaml`。
+- **文件损坏保护**：配置读取或解析失败时暂停自动保存，避免覆盖原文件；请修正文件后重新运行，或使用 `Clear Config` 清除并恢复默认设置。
+- **清除配置**：`Clear Config` 同时删除 `Config.yaml` 和旧版 `Config.json`，避免下次启动重新迁移旧设置。
 - 如果执行器不支持 `writefile` / `readfile`，配置不会保存
 
 <a id="executor-compat"></a>
@@ -257,13 +260,13 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Zhoufuz/CheatGPT-ACS/
 <details>
 <summary><b>设置没有保存？</b></summary>
 
-配置写入 `CheatGPT/ACS/Config.json`，执行器需要支持 `writefile` / `readfile` ；请确认执行器允许文件读写，并检查 `CheatGPT/ACS/` 目录是否存在。没有文件权限时配置不会保存
+配置写入 `CheatGPT/ACS/Config.yaml`，执行器需要支持 `writefile` / `readfile`；请确认执行器允许文件读写，并检查 `CheatGPT/ACS/` 目录是否存在。旧版 `Config.json` 会在首次迁移后保留，之后不会随设置变化更新。如果出现配置解析错误，原文件会保留且自动保存暂停，请修正文件后重新运行，或清除配置恢复默认设置。
 </details>
 
 <details>
 <summary><b>如何恢复默认设置？</b></summary>
 
-打开 Setting → `Clear Config` → `Clear and Reset`。该操作会删除 `Config.json` 并重置所有控件，但保留 Friend/Enemy 名单与资源缓存。
+打开 Setting → `Clear Config` → `Clear and Reset`。该操作会同时删除 `Config.yaml` 和旧版 `Config.json` 并重置所有控件，保留 Friend/Enemy 名单、累计击杀与分数、资源缓存。
 </details>
 
 <details>
