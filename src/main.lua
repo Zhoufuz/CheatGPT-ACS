@@ -5277,7 +5277,7 @@ function app.createBattlefieldKillEffect()
     end
     local victim = cardLabel("Victim", 56, 7, 218, 28, 20, Enum.TextXAlignment.Left)
     victim.TextColor3 = Color3.fromRGB(177, 59, 54)
-    local killPoints = cardLabel("KillPoints", 280, 7, 58, 28, 20, Enum.TextXAlignment.Right)
+    local streakLabel = cardLabel("KillStreak", 280, 7, 58, 28, 20, Enum.TextXAlignment.Right)
     local weapon = cardLabel("Weapon", 56, 35, 282, 21, 14, Enum.TextXAlignment.Left)
     local counter = label("Score", 276, 70, 84, 32, 28, Enum.TextXAlignment.Left)
     local rowLabels = {}
@@ -5355,7 +5355,7 @@ function app.createBattlefieldKillEffect()
     end
     local function presentCard(record, now, flipped)
         currentCard, headerAt, enteredByFlip = record, now, flipped
-        victim.Text, weapon.Text, killPoints.Text = record.Name, record.Weapon, "20"
+        victim.Text, weapon.Text, streakLabel.Text = record.Name, record.Weapon, tostring(record.Streak)
     end
     local function nextCard()
         local record = cardQueue[queueFirst]
@@ -5406,7 +5406,7 @@ function app.createBattlefieldKillEffect()
             card.Size = UDim2.fromOffset(360 * horizontal, 64 * vertical)
             local textScale = math.min(horizontal, vertical)
             victim.TextSize = math.max(1, 20 * textScale)
-            killPoints.TextSize = math.max(1, 20 * textScale)
+            streakLabel.TextSize = math.max(1, 20 * textScale)
             weapon.TextSize = math.max(1, 14 * textScale)
         end
         local progress = math.clamp((now - countAt) / countTime, 0, 1)
@@ -5532,16 +5532,16 @@ function app.createBattlefieldKillEffect()
         add(points, "ENEMY HIT", humanoid)
     end
     function controller.IsPlaying() return root.Visible end
-    function controller.Play(_, player, humanoid)
+    function controller.Play(count, player, humanoid)
         if not enabled() then return end
         warm()
         local context = humanoid and contexts[humanoid]
         local now = os.clock()
         resetExpiredScore(now)
-        -- Copy strings now; queued cards retain the correct victim and weapon
-        -- after a weapon switch, player departure or later hit context update.
+        -- Snapshot each kill so queued cards keep their own streak and details.
         local record = {Name = player and player.Name or "ENEMY KILLED",
-            Weapon = context and now - context.At <= 0.9 and context.Weapon or ""}
+            Weapon = context and now - context.At <= 0.9 and context.Weapon or "",
+            Streak = count}
         if not cardsActive(now) then
             presentCard(record, now, false)
         else
