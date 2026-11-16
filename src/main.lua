@@ -140,7 +140,7 @@ function app.createToastSystem(gui, useNative, onEmpty)
     end)
 
     local toastLayout = Instance.new("UIListLayout")
-    toastLayout.Padding = UDim.new(0, 8)
+    toastLayout.Padding = UDim.new(0, 4)
     toastLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
     toastLayout.VerticalAlignment = Enum.VerticalAlignment.Top
     toastLayout.SortOrder = Enum.SortOrder.LayoutOrder
@@ -193,62 +193,106 @@ function app.createToastSystem(gui, useNative, onEmpty)
         card.Size = UDim2.new(0, TOAST_WIDTH, 0, 0)
         card.AutomaticSize = Enum.AutomaticSize.Y
         card.Position = UDim2.new(1, 12, 0, 0) -- 起始在右侧屏外
-        card.BackgroundColor3 = app.THEME.section
-        card.BackgroundTransparency = 0.08
+        card.BackgroundTransparency = 1
         card.BorderSizePixel = 0
         card.GroupTransparency = 1
         card.Parent = holder
-        app.addCorner(card, 8)
-        app.addStroke(card, app.THEME.line, 1, 0.45)
+        -- Keep the optical layers inside the CanvasGroup so shadows fade with
+        -- the card. Native frames/gradients need no downloaded textures or blur loop.
+        local function surface(name, color, transparency, position, size, radius)
+            local frame = Instance.new("Frame")
+            frame.Name = name
+            frame.Position = position
+            frame.Size = size
+            frame.BackgroundColor3 = color
+            frame.BackgroundTransparency = transparency
+            frame.BorderSizePixel = 0
+            frame.Parent = card
+            app.addCorner(frame, radius)
+            return frame
+        end
+        surface("ShadowOuter", Color3.new(0, 0, 0), 0.94,
+            UDim2.fromOffset(0, 6), UDim2.new(1, 0, 1, -6), 16)
+        surface("ShadowMiddle", Color3.new(0, 0, 0), 0.88,
+            UDim2.fromOffset(2, 5), UDim2.new(1, -4, 1, -8), 15)
+        surface("ShadowInner", Color3.new(0, 0, 0), 0.78,
+            UDim2.fromOffset(4, 4), UDim2.new(1, -8, 1, -9), 13)
+        local glass = surface("FrostedSurface", Color3.new(1, 1, 1), 0.14,
+            UDim2.fromOffset(6, 2), UDim2.new(1, -12, 1, -8), 12)
+        local tint = Instance.new("UIGradient")
+        tint.Rotation = 90
+        tint.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(49, 51, 58)),
+            ColorSequenceKeypoint.new(0.45, Color3.fromRGB(33, 35, 41)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(25, 27, 32)),
+        })
+        tint.Parent = glass
+        app.addStroke(glass, Color3.fromRGB(145, 151, 165), 1, 0.8)
 
-        -- 左侧强调条：错误通知使用红色，普通通知继续使用主题强调色。
-        local bar = Instance.new("Frame")
-        bar.Name = app.randomName()
-        bar.Size = UDim2.new(0, 3, 1, 0)
-        bar.BackgroundColor3 = errorStyle and app.THEME.red or app.THEME.accentSoft
-        bar.BorderSizePixel = 0
-        bar.Parent = card
+        local sheen = surface("SurfaceSheen", Color3.new(1, 1, 1), 0.94,
+            UDim2.fromOffset(7, 3), UDim2.new(1, -14, 1, -10), 11)
+        local sheenFade = Instance.new("UIGradient")
+        sheenFade.Rotation = 100
+        sheenFade.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(0.45, 0.85),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        sheenFade.Parent = sheen
+        local edge = surface("TopHighlight", Color3.new(1, 1, 1), 0.7,
+            UDim2.fromOffset(18, 2), UDim2.new(1, -36, 0, 1), 1)
+        local edgeFade = Instance.new("UIGradient")
+        edgeFade.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.3, 0.2),
+            NumberSequenceKeypoint.new(0.7, 0.45), NumberSequenceKeypoint.new(1, 1),
+        })
+        edgeFade.Parent = edge
+
+        local bar = surface("StatusAccent", errorStyle and app.THEME.red or app.THEME.accentSoft,
+            0.12, UDim2.fromOffset(14, 18), UDim2.fromOffset(2, 12), 1)
+        bar.Visible = not (icon or iconKey)
 
         -- 可选圆形头像(离开通知等带玩家的消息用),有头像时正文右移
-        local bodyX = 13
+        local bodyX = 18
         if icon or iconKey then
             local avatar = Instance.new("ImageLabel")
             avatar.Name = app.randomName()
-            avatar.Size = UDim2.new(0, 36, 0, 36)
-            avatar.Position = UDim2.new(0, 13, 0, 10)
+            avatar.Size = UDim2.fromOffset(32, 32)
+            avatar.Position = UDim2.fromOffset(18, 14)
             avatar.BackgroundColor3 = app.THEME.section2
             avatar.Image = icon or ""
             avatar.Parent = card
             if iconKey then app.bindTabIcon(avatar, iconKey)
             else app.bindAsyncImage(avatar, function() return icon end, "Toast avatar") end
-            app.addCorner(avatar, 18) -- 半径=边长一半,圆形
+            app.addCorner(avatar, 16)
             app.addStroke(avatar, app.THEME.line, 1, 0.45)
-            bodyX = 57
+            bodyX = 58
         end
 
+        local contentWidth = TOAST_WIDTH - bodyX - 24
         local body = Instance.new("Frame")
         body.Name = app.randomName()
-        body.Size = UDim2.new(1, -bodyX, 0, 0)
+        body.Size = UDim2.fromOffset(TOAST_WIDTH - bodyX - 6, 0)
         body.AutomaticSize = Enum.AutomaticSize.Y
         body.Position = UDim2.new(0, bodyX, 0, 0)
         body.BackgroundTransparency = 1
         body.Parent = card
 
         local pad = Instance.new("UIPadding")
-        pad.PaddingTop = UDim.new(0, 9)
-        pad.PaddingBottom = UDim.new(0, 9)
+        pad.PaddingTop = UDim.new(0, 14)
+        pad.PaddingBottom = UDim.new(0, 20)
         pad.PaddingLeft = UDim.new(0, 8)
         pad.PaddingRight = UDim.new(0, 10)
         pad.Parent = body
 
         local layout = Instance.new("UIListLayout")
-        layout.Padding = UDim.new(0, 3)
+        layout.Padding = UDim.new(0, 5)
         layout.SortOrder = Enum.SortOrder.LayoutOrder
         layout.Parent = body
 
         local titleLabel = Instance.new("TextLabel")
         titleLabel.Name = app.randomName()
-        titleLabel.Size = UDim2.fromOffset(TOAST_WIDTH - bodyX - 46, 20)
+        titleLabel.Size = UDim2.fromOffset(contentWidth - 34, 20)
         titleLabel.BackgroundTransparency = 1
         titleLabel.Text = title
         titleLabel.TextColor3 = app.THEME.text
@@ -262,28 +306,35 @@ function app.createToastSystem(gui, useNative, onEmpty)
         local closeButton = Instance.new("TextButton")
         closeButton.Name = "ToastClose"
         closeButton.AnchorPoint = Vector2.new(1, 0)
-        closeButton.Position = UDim2.new(1, -4, 0, 2)
+        closeButton.Position = UDim2.new(1, -12, 0, 8)
         closeButton.Size = UDim2.fromOffset(28, 28)
-        closeButton.BackgroundTransparency = 1
+        closeButton.BackgroundColor3 = Color3.new(1, 1, 1)
+        closeButton.BackgroundTransparency = 0.97
         closeButton.BorderSizePixel = 0
         closeButton.Text = "X"
-        closeButton.TextSize = 13
+        closeButton.TextSize = 11
         closeButton.TextColor3 = app.THEME.sub
         closeButton.AutoButtonColor = false
         closeButton.ZIndex = 2
         app.applyFont(closeButton, Enum.Font.GothamMedium)
         closeButton.Parent = card
-        closeButton.MouseEnter:Connect(function() closeButton.TextColor3 = app.THEME.text end)
-        closeButton.MouseLeave:Connect(function() closeButton.TextColor3 = app.THEME.sub end)
+        app.addCorner(closeButton, 8)
+        app.addStroke(closeButton, Color3.new(1, 1, 1), 1, 0.94)
+        closeButton.MouseEnter:Connect(function()
+            app.tween(closeButton, 0.12, {TextColor3 = app.THEME.text, BackgroundTransparency = 0.9}):Play()
+        end)
+        closeButton.MouseLeave:Connect(function()
+            app.tween(closeButton, 0.12, {TextColor3 = app.THEME.sub, BackgroundTransparency = 0.97}):Play()
+        end)
         closeButton.Activated:Connect(function() dismissToast(holder, card) end)
 
         local textLabel = Instance.new("TextLabel")
         textLabel.Name = app.randomName()
-        textLabel.Size = UDim2.new(1, 0, 0, 0)
+        textLabel.Size = UDim2.fromOffset(contentWidth, 0)
         textLabel.AutomaticSize = Enum.AutomaticSize.Y
         textLabel.BackgroundTransparency = 1
         textLabel.Text = text
-        textLabel.TextColor3 = app.THEME.sub
+        textLabel.TextColor3 = Color3.fromRGB(175, 179, 190)
         app.applyFont(textLabel, Enum.Font.GothamMedium)
         textLabel.TextSize = 12
         textLabel.TextWrapped = true
@@ -295,8 +346,9 @@ function app.createToastSystem(gui, useNative, onEmpty)
         if copyText then
             local copyBtn = Instance.new("TextButton")
             copyBtn.Name = app.randomName()
-            copyBtn.Size = UDim2.new(1, 0, 0, 24)
-            copyBtn.BackgroundColor3 = app.THEME.section2
+            copyBtn.Size = UDim2.fromOffset(contentWidth, 26)
+            copyBtn.BackgroundColor3 = Color3.new(1, 1, 1)
+            copyBtn.BackgroundTransparency = 0.96
             copyBtn.Text = "Copy"
             copyBtn.TextColor3 = app.THEME.text
             app.applyFont(copyBtn, Enum.Font.GothamMedium)
@@ -305,10 +357,10 @@ function app.createToastSystem(gui, useNative, onEmpty)
             copyBtn.LayoutOrder = 3
             copyBtn.Parent = body
             app.addCorner(copyBtn, 6)
-            app.addStroke(copyBtn, app.THEME.line, 1, 0.45)
+            app.addStroke(copyBtn, Color3.new(1, 1, 1), 1, 0.92)
             if type(setclipboard) ~= "function" then
                 copyBtn.TextTransparency = 0.55
-                copyBtn.BackgroundTransparency = 0.45
+                copyBtn.BackgroundTransparency = 0.98
             end
             copyBtn.Activated:Connect(function()
                 if type(setclipboard) ~= "function" then
@@ -329,9 +381,9 @@ function app.createToastSystem(gui, useNative, onEmpty)
         -- Each displayed toast owns its lifetime; queued notifications start full.
         local lifetimeTrack = Instance.new("Frame")
         lifetimeTrack.Name = "LifetimeTrack"
-        lifetimeTrack.Size = UDim2.fromOffset(TOAST_WIDTH - bodyX - 18, 2)
-        lifetimeTrack.BackgroundColor3 = app.THEME.line
-        lifetimeTrack.BackgroundTransparency = 0.5
+        lifetimeTrack.Size = UDim2.fromOffset(contentWidth, 2)
+        lifetimeTrack.BackgroundColor3 = Color3.new(1, 1, 1)
+        lifetimeTrack.BackgroundTransparency = 0.94
         lifetimeTrack.BorderSizePixel = 0
         lifetimeTrack.ClipsDescendants = true
         lifetimeTrack.LayoutOrder = 4
@@ -342,6 +394,7 @@ function app.createToastSystem(gui, useNative, onEmpty)
         lifetimeFill.Name = "LifetimeFill"
         lifetimeFill.Size = UDim2.fromScale(1, 1)
         lifetimeFill.BackgroundColor3 = errorStyle and app.THEME.red or app.THEME.accentSoft
+        lifetimeFill.BackgroundTransparency = 0.12
         lifetimeFill.BorderSizePixel = 0
         lifetimeFill.Parent = lifetimeTrack
         app.addCorner(lifetimeFill, 1)
