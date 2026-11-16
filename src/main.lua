@@ -12540,6 +12540,7 @@ do
 
     pushToast = function(title, text, duration, icon, copyText, errorStyle, iconKey)
         notifySeq += 1
+        local lifetime = math.max(0.5, duration or 4)
         -- holder 负责在列表里占位(自动高度),card 在 holder 内做滑入滑出
         local holder = Instance.new("Frame")
         holder.Name = app.randomName()
@@ -12671,9 +12672,33 @@ do
             end)
         end
 
+        -- Each displayed toast owns its lifetime; queued notifications start full.
+        local lifetimeTrack = Instance.new("Frame")
+        lifetimeTrack.Name = "LifetimeTrack"
+        lifetimeTrack.Size = UDim2.fromOffset(TOAST_WIDTH - bodyX - 18, 2)
+        lifetimeTrack.BackgroundColor3 = app.THEME.line
+        lifetimeTrack.BackgroundTransparency = 0.5
+        lifetimeTrack.BorderSizePixel = 0
+        lifetimeTrack.ClipsDescendants = true
+        lifetimeTrack.LayoutOrder = 4
+        lifetimeTrack.Parent = body
+        app.addCorner(lifetimeTrack, 1)
+
+        local lifetimeFill = Instance.new("Frame")
+        lifetimeFill.Name = "LifetimeFill"
+        lifetimeFill.Size = UDim2.fromScale(1, 1)
+        lifetimeFill.BackgroundColor3 = errorStyle and app.THEME.red or app.THEME.accentSoft
+        lifetimeFill.BorderSizePixel = 0
+        lifetimeFill.Parent = lifetimeTrack
+        app.addCorner(lifetimeFill, 1)
+
+        local lifetimeTween = TweenService:Create(lifetimeFill,
+            TweenInfo.new(lifetime, Enum.EasingStyle.Linear), {Size = UDim2.fromScale(0, 1)})
+        holder.Destroying:Connect(function() lifetimeTween:Cancel() end)
         table.insert(activeToasts, holder)
         app.tween(card, 0.25, {Position = UDim2.new(0, 0, 0, 0), GroupTransparency = 0}):Play()
-        task.delay(math.max(0.5, duration or 4), function()
+        lifetimeTween:Play()
+        task.delay(lifetime, function()
             if holder.Parent then
                 dismissToast(holder, card)
             end
