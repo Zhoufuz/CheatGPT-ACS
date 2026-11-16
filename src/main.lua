@@ -22,6 +22,409 @@ local Lighting = game:GetService("Lighting")
 local TextService = game:GetService("TextService")
 local LocalPlayer = Players.LocalPlayer
 
+-- ================= UI 主题与辅助函数 =================
+app.THEME = {
+    bg = Color3.fromRGB(17, 17, 19),
+    panel = Color3.fromRGB(22, 22, 25),
+    section = Color3.fromRGB(27, 27, 31),
+    section2 = Color3.fromRGB(32, 32, 37),
+    line = Color3.fromRGB(44, 44, 50),
+    text = Color3.fromRGB(236, 236, 239),
+    sub = Color3.fromRGB(150, 150, 158),
+    accent = Color3.fromRGB(245, 245, 245),
+    accentSoft = Color3.fromRGB(205, 205, 210),
+    green = Color3.fromRGB(120, 255, 140),
+    red = Color3.fromRGB(205, 82, 82),
+}
+
+function app.addCorner(obj, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = obj
+    return c
+end
+
+function app.addStroke(obj, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or app.THEME.line
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = obj
+    return s
+end
+
+function app.tween(obj, t, props)
+    return TweenService:Create(obj, TweenInfo.new(t or 0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+end
+
+-- Full SoftRound CJK font, verified LZMA2 resource from the pinned assets revision.
+-- The cache filename includes the source fingerprint so previous fonts cannot be reused.
+app.UI_FONT_OBJECTS = setmetatable({}, {__mode = "k"})
+function app.applyFont(object, fallback)
+    app.UI_FONT_OBJECTS[object] = true
+    if app.UI_FONT then
+        object.FontFace = app.UI_FONT
+    else
+        object.Font = fallback or Enum.Font.GothamMedium
+    end
+end
+
+function app.randomName()
+    local len = math.random(15, 30)
+    local chars = {}
+    for i = 1, len do
+        local cp
+        repeat
+            cp = math.random(0x20, 0x10FFFF)
+        until cp < 0xD800 or cp > 0xDFFF
+        chars[i] = utf8.char(cp)
+    end
+    return table.concat(chars)
+end
+function app.computeUIScale(viewport, touch)
+    local short = math.min(viewport.X, viewport.Y)
+    local wanted = touch and math.clamp(short / 720, 1, 2.25) or math.clamp(short / 900 * 1.45, 1, 2.5)
+    return math.max(0.25, math.min(wanted, (viewport.X - 24) / 350, (viewport.Y - 32) / 360))
+end
+
+function app.createToastSystem(gui, useNative, onEmpty)
+    local stopped = false
+    local closing, lifetimeTweens = {}, {}
+    local activeToasts = {}
+    local notifyQueue = {}   -- 超出同屏上限的排队
+    local notifySeq = 0
+    local MAX_TOASTS = 5
+    local TOAST_WIDTH = 300
+
+    -- 右上角堆叠层(独立于主窗口,主 GUI 隐藏时通知照常显示)
+    local toastLayer = Instance.new("Frame")
+    toastLayer.Name = app.randomName()
+    toastLayer.AnchorPoint = Vector2.new(1, 0)
+    toastLayer.Position = UDim2.new(1, -12, 0, 44)
+    toastLayer.Size = UDim2.new(0, TOAST_WIDTH, 1, -56)
+    toastLayer.BackgroundTransparency = 1
+    toastLayer.Parent = gui
+
+    -- PC 端 Toast 同步放大(锚点在右上角,放大后钉位不变;层透明不可见,高度随放大超屏无影响)
+    local function layoutToasts(viewport, scale)
+        toastLayer.Position = UDim2.new(1, -12, 0, math.min(44 * scale, viewport.Y * 0.12))
+        toastLayer.Size = UDim2.fromOffset(TOAST_WIDTH, math.max(0, viewport.Y - 56 * scale) / scale)
+    end
+    local resizeConnection
+    if useNative and app.registerResponsiveRoot then
+        app.registerResponsiveRoot(toastLayer, false, layoutToasts)
+    else
+        local scale = Instance.new("UIScale")
+        scale.Parent = toastLayer
+        local function resize()
+            local viewport = gui.AbsoluteSize
+            if viewport.X <= 0 or viewport.Y <= 0 then
+                local camera = Workspace.CurrentCamera
+                viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
+            end
+            scale.Scale = app.computeUIScale(viewport, UserInputService.TouchEnabled)
+            layoutToasts(viewport, scale.Scale)
+        end
+        resizeConnection = gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(resize)
+        resize()
+    end
+    gui.Destroying:Connect(function()
+        stopped = true
+        if resizeConnection then resizeConnection:Disconnect() end
+        table.clear(notifyQueue)
+        for _, animation in pairs(lifetimeTweens) do animation:Cancel() end
+        table.clear(lifetimeTweens)
+        table.clear(activeToasts)
+        table.clear(closing)
+    end)
+
+    local toastLayout = Instance.new("UIListLayout")
+    toastLayout.Padding = UDim.new(0, 8)
+    toastLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    toastLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+    toastLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    toastLayout.Parent = toastLayer
+
+    local pushToast -- 前向声明(dismiss 完成后要消费队列)
+
+    local function dismissToast(holder, card)
+        if stopped or closing[holder] or not holder.Parent then return end
+        closing[holder] = true
+        if lifetimeTweens[holder] then lifetimeTweens[holder]:Cancel() end
+        -- 滑出 + 淡出后销毁,从活跃表移除并给队列补位
+        -- (tween 只创建不播放,必须 :Play()——之前漏了,Completed 永不触发,通知永远不消失)
+        local out = app.tween(card, 0.2, {Position = UDim2.new(1, 12, 0, 0), GroupTransparency = 1})
+        out.Completed:Connect(function()
+            if stopped or not holder.Parent then return end
+            for i, h in ipairs(activeToasts) do
+                if h == holder then
+                    table.remove(activeToasts, i)
+                    break
+                end
+            end
+            holder:Destroy()
+            closing[holder], lifetimeTweens[holder] = nil, nil
+            if #notifyQueue > 0 then
+                local n = table.remove(notifyQueue, 1)
+                pushToast(n.title, n.text, n.duration, n.icon, n.copyText, n.errorStyle, n.iconKey)
+            elseif #activeToasts == 0 and onEmpty then
+                onEmpty()
+            end
+        end)
+        out:Play()
+    end
+
+    pushToast = function(title, text, duration, icon, copyText, errorStyle, iconKey)
+        notifySeq += 1
+        local lifetime = math.max(0.5, duration or 4)
+        -- holder 负责在列表里占位(自动高度),card 在 holder 内做滑入滑出
+        local holder = Instance.new("Frame")
+        holder.Name = app.randomName()
+        holder.Size = UDim2.new(0, TOAST_WIDTH, 0, 0)
+        holder.AutomaticSize = Enum.AutomaticSize.Y
+        holder.BackgroundTransparency = 1
+        holder.ClipsDescendants = true
+        holder.LayoutOrder = -notifySeq -- 最新在最上面
+        holder.Parent = toastLayer
+
+        local card = Instance.new("CanvasGroup")
+        card.Name = app.randomName()
+        card.Size = UDim2.new(0, TOAST_WIDTH, 0, 0)
+        card.AutomaticSize = Enum.AutomaticSize.Y
+        card.Position = UDim2.new(1, 12, 0, 0) -- 起始在右侧屏外
+        card.BackgroundColor3 = app.THEME.section
+        card.BackgroundTransparency = 0.08
+        card.BorderSizePixel = 0
+        card.GroupTransparency = 1
+        card.Parent = holder
+        app.addCorner(card, 8)
+        app.addStroke(card, app.THEME.line, 1, 0.45)
+
+        -- 左侧强调条：错误通知使用红色，普通通知继续使用主题强调色。
+        local bar = Instance.new("Frame")
+        bar.Name = app.randomName()
+        bar.Size = UDim2.new(0, 3, 1, 0)
+        bar.BackgroundColor3 = errorStyle and app.THEME.red or app.THEME.accentSoft
+        bar.BorderSizePixel = 0
+        bar.Parent = card
+
+        -- 可选圆形头像(离开通知等带玩家的消息用),有头像时正文右移
+        local bodyX = 13
+        if icon or iconKey then
+            local avatar = Instance.new("ImageLabel")
+            avatar.Name = app.randomName()
+            avatar.Size = UDim2.new(0, 36, 0, 36)
+            avatar.Position = UDim2.new(0, 13, 0, 10)
+            avatar.BackgroundColor3 = app.THEME.section2
+            avatar.Image = icon or ""
+            avatar.Parent = card
+            if iconKey then app.bindTabIcon(avatar, iconKey)
+            else app.bindAsyncImage(avatar, function() return icon end, "Toast avatar") end
+            app.addCorner(avatar, 18) -- 半径=边长一半,圆形
+            app.addStroke(avatar, app.THEME.line, 1, 0.45)
+            bodyX = 57
+        end
+
+        local body = Instance.new("Frame")
+        body.Name = app.randomName()
+        body.Size = UDim2.new(1, -bodyX, 0, 0)
+        body.AutomaticSize = Enum.AutomaticSize.Y
+        body.Position = UDim2.new(0, bodyX, 0, 0)
+        body.BackgroundTransparency = 1
+        body.Parent = card
+
+        local pad = Instance.new("UIPadding")
+        pad.PaddingTop = UDim.new(0, 9)
+        pad.PaddingBottom = UDim.new(0, 9)
+        pad.PaddingLeft = UDim.new(0, 8)
+        pad.PaddingRight = UDim.new(0, 10)
+        pad.Parent = body
+
+        local layout = Instance.new("UIListLayout")
+        layout.Padding = UDim.new(0, 3)
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Parent = body
+
+        local titleLabel = Instance.new("TextLabel")
+        titleLabel.Name = app.randomName()
+        titleLabel.Size = UDim2.fromOffset(TOAST_WIDTH - bodyX - 46, 20)
+        titleLabel.BackgroundTransparency = 1
+        titleLabel.Text = title
+        titleLabel.TextColor3 = app.THEME.text
+        app.applyFont(titleLabel, Enum.Font.GothamBold)
+        titleLabel.TextSize = 13
+        titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+        titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        titleLabel.LayoutOrder = 1
+        titleLabel.Parent = body
+
+        local closeButton = Instance.new("TextButton")
+        closeButton.Name = "ToastClose"
+        closeButton.AnchorPoint = Vector2.new(1, 0)
+        closeButton.Position = UDim2.new(1, -4, 0, 2)
+        closeButton.Size = UDim2.fromOffset(28, 28)
+        closeButton.BackgroundTransparency = 1
+        closeButton.BorderSizePixel = 0
+        closeButton.Text = "X"
+        closeButton.TextSize = 13
+        closeButton.TextColor3 = app.THEME.sub
+        closeButton.AutoButtonColor = false
+        closeButton.ZIndex = 2
+        app.applyFont(closeButton, Enum.Font.GothamMedium)
+        closeButton.Parent = card
+        closeButton.MouseEnter:Connect(function() closeButton.TextColor3 = app.THEME.text end)
+        closeButton.MouseLeave:Connect(function() closeButton.TextColor3 = app.THEME.sub end)
+        closeButton.Activated:Connect(function() dismissToast(holder, card) end)
+
+        local textLabel = Instance.new("TextLabel")
+        textLabel.Name = app.randomName()
+        textLabel.Size = UDim2.new(1, 0, 0, 0)
+        textLabel.AutomaticSize = Enum.AutomaticSize.Y
+        textLabel.BackgroundTransparency = 1
+        textLabel.Text = text
+        textLabel.TextColor3 = app.THEME.sub
+        app.applyFont(textLabel, Enum.Font.GothamMedium)
+        textLabel.TextSize = 12
+        textLabel.TextWrapped = true
+        textLabel.TextXAlignment = Enum.TextXAlignment.Left
+        textLabel.LayoutOrder = 2
+        textLabel.Parent = body
+
+        -- 可选复制按钮(报错通知用:一键复制错误内容到剪贴板)
+        if copyText then
+            local copyBtn = Instance.new("TextButton")
+            copyBtn.Name = app.randomName()
+            copyBtn.Size = UDim2.new(1, 0, 0, 24)
+            copyBtn.BackgroundColor3 = app.THEME.section2
+            copyBtn.Text = "Copy"
+            copyBtn.TextColor3 = app.THEME.text
+            app.applyFont(copyBtn, Enum.Font.GothamMedium)
+            copyBtn.TextSize = 12
+            copyBtn.AutoButtonColor = false
+            copyBtn.LayoutOrder = 3
+            copyBtn.Parent = body
+            app.addCorner(copyBtn, 6)
+            app.addStroke(copyBtn, app.THEME.line, 1, 0.45)
+            if type(setclipboard) ~= "function" then
+                copyBtn.TextTransparency = 0.55
+                copyBtn.BackgroundTransparency = 0.45
+            end
+            copyBtn.Activated:Connect(function()
+                if type(setclipboard) ~= "function" then
+                    if app.notifyUnsupportedFunc then app.notifyUnsupportedFunc("setclipboard") end
+                    return
+                end
+                local copied, err = pcall(setclipboard, copyText)
+                if not copied then warn("[CheatGPT] Copy failed: " .. tostring(err)); return end
+                copyBtn.Text = "Copied!"
+                task.delay(1, function()
+                    if copyBtn.Parent then
+                        copyBtn.Text = "Copy"
+                    end
+                end)
+            end)
+        end
+
+        -- Each displayed toast owns its lifetime; queued notifications start full.
+        local lifetimeTrack = Instance.new("Frame")
+        lifetimeTrack.Name = "LifetimeTrack"
+        lifetimeTrack.Size = UDim2.fromOffset(TOAST_WIDTH - bodyX - 18, 2)
+        lifetimeTrack.BackgroundColor3 = app.THEME.line
+        lifetimeTrack.BackgroundTransparency = 0.5
+        lifetimeTrack.BorderSizePixel = 0
+        lifetimeTrack.ClipsDescendants = true
+        lifetimeTrack.LayoutOrder = 4
+        lifetimeTrack.Parent = body
+        app.addCorner(lifetimeTrack, 1)
+
+        local lifetimeFill = Instance.new("Frame")
+        lifetimeFill.Name = "LifetimeFill"
+        lifetimeFill.Size = UDim2.fromScale(1, 1)
+        lifetimeFill.BackgroundColor3 = errorStyle and app.THEME.red or app.THEME.accentSoft
+        lifetimeFill.BorderSizePixel = 0
+        lifetimeFill.Parent = lifetimeTrack
+        app.addCorner(lifetimeFill, 1)
+
+        local lifetimeTween = TweenService:Create(lifetimeFill,
+            TweenInfo.new(lifetime, Enum.EasingStyle.Linear), {Size = UDim2.fromScale(0, 1)})
+        lifetimeTweens[holder] = lifetimeTween
+        holder.Destroying:Connect(function()
+            lifetimeTween:Cancel()
+            lifetimeTweens[holder] = nil
+        end)
+        table.insert(activeToasts, holder)
+        app.tween(card, 0.25, {Position = UDim2.new(0, 0, 0, 0), GroupTransparency = 0}):Play()
+        lifetimeTween:Play()
+        task.delay(lifetime, function()
+            if holder.Parent then
+                dismissToast(holder, card)
+            end
+        end)
+    end
+
+    -- 私有共享入口:开关开着走自定义 Toast(超上限排队);关了回退原生通知
+    -- opts: { icon = 图片id, copyText = 复制按钮内容 }
+    return function(title, text, duration, opts)
+        if stopped then return end
+        local iconKey = opts and opts.iconKey
+        local icon = opts and opts.icon
+        local copyText = opts and opts.copyText
+        local errorStyle = opts and opts.error == true
+        if useNative and useNative() then
+            app.xpcallw(function()
+                StarterGui:SetCore("SendNotification", {Title = title, Text = text, Duration = duration or 4})
+            end, "通知")
+            return
+        end
+        if #activeToasts >= MAX_TOASTS then
+            table.insert(notifyQueue, {
+                title = title,
+                text = text,
+                duration = duration,
+                icon = icon, iconKey = iconKey,
+                copyText = copyText,
+                errorStyle = errorStyle,
+            })
+            return
+        end
+        if app.xpcallw then
+            app.xpcallw(pushToast, "通知", title, text, duration, icon, copyText, errorStyle, iconKey)
+        else
+            local ok, err = pcall(pushToast, title, text, duration, icon, copyText, errorStyle, iconKey)
+            if not ok then warn("[CheatGPT] Notification failed: " .. tostring(err)) end
+        end
+    end
+end
+
+
+-- Startup failures share the toast renderer but own a small independent host:
+-- ACS may fail before the main GUI exists, or after that GUI has been disabled.
+function app.showStartupNotification(message)
+    if not app.startupToastGui or not app.startupToastGui.Parent then
+        local host = Instance.new("ScreenGui")
+        host.Name = "CheatGPTStartupNotifications"
+        host.ResetOnSpawn = false
+        host.IgnoreGuiInset = true
+        host.DisplayOrder = 1000
+        host.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        local parent = CoreGui
+        if type(gethui) == "function" then
+            local ok, result = pcall(gethui)
+            if ok and result then parent = result end
+        end
+        host.Parent = parent
+        app.startupToastGui = host
+        host.Destroying:Connect(function()
+            if app.startupToastGui == host then
+                app.startupToastGui, app.startupToastShow = nil, nil
+            end
+        end)
+        app.startupToastShow = app.createToastSystem(host, nil, function() host:Destroy() end)
+    end
+    app.startupToastShow("CheatGPT.cc", message, 10, {error = true, copyText = message})
+end
+
 -- 多层运行锁：同时校验执行器全局环境、shared 状态和 CoreGui 隐形哨兵，避免只依赖一个可读写的布尔值。
 app.CHEATGPT_RUNTIME_SIGNATURE = "CheatGPT.Runtime.Lock.v3"
 app.CHEATGPT_RUNTIME_SENTINEL_NAME = "__CheatGPTRuntime_7F3A91D2"
@@ -154,13 +557,8 @@ local startup = {stage = "启动检查", retrySafe = true}
 function app.startupReport(state, message, failed)
     state.lastMessage = message
     if not failed then return end
-    if app.showNotification then
-        pcall(app.showNotification, "CheatGPT.cc", message, 10, {error = true, copyText = message})
-    else
-        pcall(StarterGui.SetCore, StarterGui, "SendNotification", {
-            Title = "CheatGPT.cc", Text = message, Duration = 10,
-        })
-    end
+    local ok, err = pcall(app.showStartupNotification, message)
+    if not ok then warn("[CheatGPT] Startup notification failed: " .. tostring(err)) end
 end
 
 do
@@ -2081,20 +2479,6 @@ local function startSpin()
     spinning = true
 end
 
--- 生成完全随机的 Unicode 名称
-function app.randomName()
-    local len = math.random(15, 30)
-    local chars = {}
-    for i = 1, len do
-        local cp
-        repeat
-            cp = math.random(0x20, 0x10FFFF)
-        until cp < 0xD800 or cp > 0xDFFF
-        chars[i] = utf8.char(cp)
-    end
-    return table.concat(chars)
-end
-
 -- 创建受保护的文件夹
 function app.createProtectedFolder(parent, name)
     local folder = Instance.new("Folder")
@@ -2386,54 +2770,6 @@ startup.retrySafe = false
 startup.stage = "创建主界面"
 app.startupReport(startup, "正在创建主界面…", false)
 
--- ================= UI 主题与辅助函数 =================
-app.THEME = {
-    bg = Color3.fromRGB(17, 17, 19),
-    panel = Color3.fromRGB(22, 22, 25),
-    section = Color3.fromRGB(27, 27, 31),
-    section2 = Color3.fromRGB(32, 32, 37),
-    line = Color3.fromRGB(44, 44, 50),
-    text = Color3.fromRGB(236, 236, 239),
-    sub = Color3.fromRGB(150, 150, 158),
-    accent = Color3.fromRGB(245, 245, 245),
-    accentSoft = Color3.fromRGB(205, 205, 210),
-    green = Color3.fromRGB(120, 255, 140),
-    red = Color3.fromRGB(205, 82, 82),
-}
-
-function app.addCorner(obj, radius)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, radius or 8)
-    c.Parent = obj
-    return c
-end
-
-function app.addStroke(obj, color, thickness, transparency)
-    local s = Instance.new("UIStroke")
-    s.Color = color or app.THEME.line
-    s.Thickness = thickness or 1
-    s.Transparency = transparency or 0
-    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-    s.Parent = obj
-    return s
-end
-
-function app.tween(obj, t, props)
-    return TweenService:Create(obj, TweenInfo.new(t or 0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
-end
-
--- Full SoftRound CJK font, verified LZMA2 resource from the pinned assets revision.
--- The cache filename includes the source fingerprint so previous fonts cannot be reused.
-app.UI_FONT_OBJECTS = setmetatable({}, {__mode = "k"})
-function app.applyFont(object, fallback)
-    app.UI_FONT_OBJECTS[object] = true
-    if app.UI_FONT then
-        object.FontFace = app.UI_FONT
-    else
-        object.Font = fallback or Enum.Font.GothamMedium
-    end
-end
-
 function app.readResourceUiFontBytes()
     return app.readResourceBytes({Path="cheatgpt/v1/fonts/SoftRoundCJK-9ae2e3002585.ttf.lzma2", Size=6168744, CRC32=3926058858, PackedSize=3054961, PackedCRC32=216930294}, "CheatGPT/ACS/Cache/SoftRoundCJK-9ae2e3002585.ttf")
 end
@@ -2502,11 +2838,7 @@ dropdownLayer.ZIndex = 200
 dropdownLayer.Parent = gui
 
 -- BEGIN RESPONSIVE UI
-function app.computeUIScale(viewport, touch)
-    local short = math.min(viewport.X, viewport.Y)
-    local wanted = touch and math.clamp(short / 720, 1, 2.25) or math.clamp(short / 900 * 1.45, 1, 2.5)
-    return math.max(0.25, math.min(wanted, (viewport.X - 24) / 350, (viewport.Y - 32) / 360))
-end
+
 function app.killBannerWidth(viewport)
     return math.max(1, math.min(viewport.X * 0.78, viewport.Y * 0.46, 900))
 end
@@ -12484,254 +12816,8 @@ do
     end)
 end
 
--- ================= 自定义通知系统（同风格 Toast，我们自己的通知专用） =================
--- 只替换本脚本发出的通知,不拦截游戏的通知(游戏该弹原生还弹原生)。
--- 全部状态收进 do-end 块,不占顶层 local 名额;共享入口为 app.showNotification(title, text, duration)
-do
-    local activeToasts = {}
-    local notifyQueue = {}   -- 超出同屏上限的排队
-    local notifySeq = 0
-    local MAX_TOASTS = 5
-    local TOAST_WIDTH = 300
-
-    -- 右上角堆叠层(独立于主窗口,主 GUI 隐藏时通知照常显示)
-    local toastLayer = Instance.new("Frame")
-    toastLayer.Name = app.randomName()
-    toastLayer.AnchorPoint = Vector2.new(1, 0)
-    toastLayer.Position = UDim2.new(1, -12, 0, 44)
-    toastLayer.Size = UDim2.new(0, TOAST_WIDTH, 1, -56)
-    toastLayer.BackgroundTransparency = 1
-    toastLayer.Parent = gui
-
-    -- PC 端 Toast 同步放大(锚点在右上角,放大后钉位不变;层透明不可见,高度随放大超屏无影响)
-    app.registerResponsiveRoot(toastLayer, false, function(viewport, scale)
-        toastLayer.Position = UDim2.new(1, -12, 0, math.min(44 * scale, viewport.Y * 0.12))
-        toastLayer.Size = UDim2.fromOffset(TOAST_WIDTH, math.max(0, viewport.Y - 56 * scale) / scale)
-    end)
-
-    local toastLayout = Instance.new("UIListLayout")
-    toastLayout.Padding = UDim.new(0, 8)
-    toastLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
-    toastLayout.VerticalAlignment = Enum.VerticalAlignment.Top
-    toastLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    toastLayout.Parent = toastLayer
-
-    local pushToast -- 前向声明(dismiss 完成后要消费队列)
-
-    local function dismissToast(holder, card)
-        -- 滑出 + 淡出后销毁,从活跃表移除并给队列补位
-        -- (tween 只创建不播放,必须 :Play()——之前漏了,Completed 永不触发,通知永远不消失)
-        local out = app.tween(card, 0.2, {Position = UDim2.new(1, 12, 0, 0), GroupTransparency = 1})
-        out.Completed:Connect(function()
-            for i, h in ipairs(activeToasts) do
-                if h == holder then
-                    table.remove(activeToasts, i)
-                    break
-                end
-            end
-            holder:Destroy()
-            if #notifyQueue > 0 then
-                local n = table.remove(notifyQueue, 1)
-                pushToast(n.title, n.text, n.duration, n.icon, n.copyText, n.errorStyle, n.iconKey)
-            end
-        end)
-        out:Play()
-    end
-
-    pushToast = function(title, text, duration, icon, copyText, errorStyle, iconKey)
-        notifySeq += 1
-        local lifetime = math.max(0.5, duration or 4)
-        -- holder 负责在列表里占位(自动高度),card 在 holder 内做滑入滑出
-        local holder = Instance.new("Frame")
-        holder.Name = app.randomName()
-        holder.Size = UDim2.new(0, TOAST_WIDTH, 0, 0)
-        holder.AutomaticSize = Enum.AutomaticSize.Y
-        holder.BackgroundTransparency = 1
-        holder.ClipsDescendants = true
-        holder.LayoutOrder = -notifySeq -- 最新在最上面
-        holder.Parent = toastLayer
-
-        local card = Instance.new("CanvasGroup")
-        card.Name = app.randomName()
-        card.Size = UDim2.new(0, TOAST_WIDTH, 0, 0)
-        card.AutomaticSize = Enum.AutomaticSize.Y
-        card.Position = UDim2.new(1, 12, 0, 0) -- 起始在右侧屏外
-        card.BackgroundColor3 = app.THEME.section
-        card.BackgroundTransparency = 0.08
-        card.BorderSizePixel = 0
-        card.GroupTransparency = 1
-        card.Parent = holder
-        app.addCorner(card, 8)
-        app.addStroke(card, app.THEME.line, 1, 0.45)
-
-        -- 左侧强调条：错误通知使用红色，普通通知继续使用主题强调色。
-        local bar = Instance.new("Frame")
-        bar.Name = app.randomName()
-        bar.Size = UDim2.new(0, 3, 1, 0)
-        bar.BackgroundColor3 = errorStyle and app.THEME.red or app.THEME.accentSoft
-        bar.BorderSizePixel = 0
-        bar.Parent = card
-
-        -- 可选圆形头像(离开通知等带玩家的消息用),有头像时正文右移
-        local bodyX = 13
-        if icon or iconKey then
-            local avatar = Instance.new("ImageLabel")
-            avatar.Name = app.randomName()
-            avatar.Size = UDim2.new(0, 36, 0, 36)
-            avatar.Position = UDim2.new(0, 13, 0, 10)
-            avatar.BackgroundColor3 = app.THEME.section2
-            avatar.Image = icon or ""
-            avatar.Parent = card
-            if iconKey then app.bindTabIcon(avatar, iconKey)
-            else app.bindAsyncImage(avatar, function() return icon end, "Toast avatar") end
-            app.addCorner(avatar, 18) -- 半径=边长一半,圆形
-            app.addStroke(avatar, app.THEME.line, 1, 0.45)
-            bodyX = 57
-        end
-
-        local body = Instance.new("Frame")
-        body.Name = app.randomName()
-        body.Size = UDim2.new(1, -bodyX, 0, 0)
-        body.AutomaticSize = Enum.AutomaticSize.Y
-        body.Position = UDim2.new(0, bodyX, 0, 0)
-        body.BackgroundTransparency = 1
-        body.Parent = card
-
-        local pad = Instance.new("UIPadding")
-        pad.PaddingTop = UDim.new(0, 9)
-        pad.PaddingBottom = UDim.new(0, 9)
-        pad.PaddingLeft = UDim.new(0, 8)
-        pad.PaddingRight = UDim.new(0, 10)
-        pad.Parent = body
-
-        local layout = Instance.new("UIListLayout")
-        layout.Padding = UDim.new(0, 3)
-        layout.SortOrder = Enum.SortOrder.LayoutOrder
-        layout.Parent = body
-
-        local titleLabel = Instance.new("TextLabel")
-        titleLabel.Name = app.randomName()
-        titleLabel.Size = UDim2.new(1, 0, 0, 14)
-        titleLabel.BackgroundTransparency = 1
-        titleLabel.Text = title
-        titleLabel.TextColor3 = app.THEME.text
-        app.applyFont(titleLabel, Enum.Font.GothamBold)
-        titleLabel.TextSize = 13
-        titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-        titleLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        titleLabel.LayoutOrder = 1
-        titleLabel.Parent = body
-
-        local textLabel = Instance.new("TextLabel")
-        textLabel.Name = app.randomName()
-        textLabel.Size = UDim2.new(1, 0, 0, 0)
-        textLabel.AutomaticSize = Enum.AutomaticSize.Y
-        textLabel.BackgroundTransparency = 1
-        textLabel.Text = text
-        textLabel.TextColor3 = app.THEME.sub
-        app.applyFont(textLabel, Enum.Font.GothamMedium)
-        textLabel.TextSize = 12
-        textLabel.TextWrapped = true
-        textLabel.TextXAlignment = Enum.TextXAlignment.Left
-        textLabel.LayoutOrder = 2
-        textLabel.Parent = body
-
-        -- 可选复制按钮(报错通知用:一键复制错误内容到剪贴板)
-        if copyText then
-            local copyBtn = Instance.new("TextButton")
-            copyBtn.Name = app.randomName()
-            copyBtn.Size = UDim2.new(1, 0, 0, 24)
-            copyBtn.BackgroundColor3 = app.THEME.section2
-            copyBtn.Text = "Copy"
-            copyBtn.TextColor3 = app.THEME.text
-            app.applyFont(copyBtn, Enum.Font.GothamMedium)
-            copyBtn.TextSize = 12
-            copyBtn.AutoButtonColor = false
-            copyBtn.LayoutOrder = 3
-            copyBtn.Parent = body
-            app.addCorner(copyBtn, 6)
-            app.addStroke(copyBtn, app.THEME.line, 1, 0.45)
-            if not app.EXEC_SUPPORT["setclipboard"] then
-                copyBtn.TextTransparency = 0.55
-                copyBtn.BackgroundTransparency = 0.45
-            end
-            copyBtn.Activated:Connect(function()
-                if not app.EXEC_SUPPORT["setclipboard"] then
-                    app.notifyUnsupportedFunc("setclipboard")
-                    return
-                end
-                app.xpcallw(function()
-                    setclipboard(copyText)
-                end, "通知")
-                copyBtn.Text = "Copied!"
-                task.delay(1, function()
-                    if copyBtn.Parent then
-                        copyBtn.Text = "Copy"
-                    end
-                end)
-            end)
-        end
-
-        -- Each displayed toast owns its lifetime; queued notifications start full.
-        local lifetimeTrack = Instance.new("Frame")
-        lifetimeTrack.Name = "LifetimeTrack"
-        lifetimeTrack.Size = UDim2.fromOffset(TOAST_WIDTH - bodyX - 18, 2)
-        lifetimeTrack.BackgroundColor3 = app.THEME.line
-        lifetimeTrack.BackgroundTransparency = 0.5
-        lifetimeTrack.BorderSizePixel = 0
-        lifetimeTrack.ClipsDescendants = true
-        lifetimeTrack.LayoutOrder = 4
-        lifetimeTrack.Parent = body
-        app.addCorner(lifetimeTrack, 1)
-
-        local lifetimeFill = Instance.new("Frame")
-        lifetimeFill.Name = "LifetimeFill"
-        lifetimeFill.Size = UDim2.fromScale(1, 1)
-        lifetimeFill.BackgroundColor3 = errorStyle and app.THEME.red or app.THEME.accentSoft
-        lifetimeFill.BorderSizePixel = 0
-        lifetimeFill.Parent = lifetimeTrack
-        app.addCorner(lifetimeFill, 1)
-
-        local lifetimeTween = TweenService:Create(lifetimeFill,
-            TweenInfo.new(lifetime, Enum.EasingStyle.Linear), {Size = UDim2.fromScale(0, 1)})
-        holder.Destroying:Connect(function() lifetimeTween:Cancel() end)
-        table.insert(activeToasts, holder)
-        app.tween(card, 0.25, {Position = UDim2.new(0, 0, 0, 0), GroupTransparency = 0}):Play()
-        lifetimeTween:Play()
-        task.delay(lifetime, function()
-            if holder.Parent then
-                dismissToast(holder, card)
-            end
-        end)
-    end
-
-    -- 私有共享入口:开关开着走自定义 Toast(超上限排队);关了回退原生通知
-    -- opts: { icon = 图片id, copyText = 复制按钮内容 }
-    function app.showNotification(title, text, duration, opts)
-        local iconKey = opts and opts.iconKey
-        local icon = opts and opts.icon
-        local copyText = opts and opts.copyText
-        local errorStyle = opts and opts.error == true
-        if not notifyEnabled then
-            app.xpcallw(function()
-                StarterGui:SetCore("SendNotification", {Title = title, Text = text, Duration = duration or 4})
-            end, "通知")
-            return
-        end
-        if #activeToasts >= MAX_TOASTS then
-            table.insert(notifyQueue, {
-                title = title,
-                text = text,
-                duration = duration,
-                icon = icon, iconKey = iconKey,
-                copyText = copyText,
-                errorStyle = errorStyle,
-            })
-            return
-        end
-        app.xpcallw(pushToast, "通知", title, text, duration, icon, copyText, errorStyle, iconKey)
-    end
-end
+-- Normal notifications retain the Notifications toggle and native fallback.
+app.showNotification = app.createToastSystem(gui, function() return not notifyEnabled end)
 
 -- ================= 离开通知逻辑 =================
 local function sendLeaveNotification(player, role)
