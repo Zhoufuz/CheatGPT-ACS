@@ -5,8 +5,27 @@ local app = {}
 app.debugErrors = {}
 function app.recordDebugError(tag, message)
     local entries = app.debugErrors
-    entries[#entries + 1] = string.format("%.1fs [%s] %s", os.clock(), tostring(tag), tostring(message):sub(1, 1000))
+    entries[#entries + 1] = string.format("%.1fs [%s] %s", os.clock(), tostring(tag), tostring(message))
     if #entries > 30 then table.remove(entries, 1) end
+end
+
+-- 必须在 xpcall 的错误处理器中调用，函数栈尚未展开时保留原始报错位置。
+function app.captureErrorReport(err, tag)
+    local message, trace = tostring(err), "Stack trace unavailable"
+    if type(debug) == "table" and type(debug.traceback) == "function" then
+        local ok, result = pcall(debug.traceback, "", 4)
+        if ok and type(result) == "string" and result ~= "" then trace = result end
+    end
+    local location, line = message:match("^(.-):(%d+):")
+    if not line then location, line = trace:match("([^\n]+):(%d+)") end
+    return table.concat({
+        "[CheatGPT.cc]",
+        "Module: " .. tostring(tag or "Unknown"),
+        "Location: " .. tostring(location or "Unavailable"),
+        "Line: " .. tostring(line or "Unavailable"),
+        "Error: " .. message,
+        "Stack trace:", trace,
+    }, "\n"), line or "?"
 end
 
 local Players = game:GetService("Players")
@@ -643,26 +662,28 @@ local startupOK, startupError = xpcall(function()
 local __xpcallw_last = {}
 function app.xpcallw(f, tag, ...)
     return xpcall(f, function(err)
+        tag = tostring(tag or "Unknown")
+        local report, line = app.captureErrorReport(err, tag)
         if app.CONFIG_RESETTING then app.CONFIG_RESET_FAILED = true end
         local now = os.clock()
         local last = __xpcallw_last[tag]
         if not last or now - last >= 5 then
             __xpcallw_last[tag] = now
-            app.recordDebugError(tag, err)
+            app.recordDebugError(tag, report)
             -- 同步弹出自定义错误通知；"通知" 来源自身出错时不再弹，避免递归
             if app.showNotification and tag ~= "通知" then
-                local line = tostring(err):match(":(%d+):") or "?"
                 pcall(app.showNotification,
                     "Oops! Something went error on line " .. line,
-                    "[CheatGPT.cc] " .. tostring(err),
+                    "[" .. tag .. "] " .. tostring(err),
                     10,
                     {
                         iconKey = "bug",
-                        copyText = tostring(err),
+                        copyText = report,
                         error = true,
                     })
             end
         end
+        return report
     end, ...)
 end
 
@@ -2666,6 +2687,41 @@ function app.readLuaUpvalues(func)
     local ok, values = pcall(debug.getupvalues, func)
     if ok and type(values) == "table" then return values, func end
     return nil
+end
+
+function app.readLuaUpvalue(func, index)
+    func = app.resolveLuaClosure(func)
+    if not func or type(index) ~= "number" or index < 1 or index % 1 ~= 0
+        or type(debug) ~= "table" or type(debug.getupvalue) ~= "function" then return nil, nil, false end
+    local ok, value = pcall(debug.getupvalue, func, index)
+    if ok then return value, func, true end -- nil/false 都可能是合法上值
+    return nil, nil, false
+end
+
+function app.readLuaConstants(func)
+    func = app.resolveLuaClosure(func)
+    if not func or type(debug) ~= "table" or type(debug.getconstants) ~= "function" then return nil end
+    local ok, values = pcall(debug.getconstants, func)
+    if ok and type(values) == "table" then return values, func end
+    return nil
+end
+
+function app.writeLuaUpvalue(func, index, value, tag)
+    func = app.resolveLuaClosure(func)
+    if not func or type(index) ~= "number" or index < 1 or index % 1 ~= 0
+        or type(debug) ~= "table" or type(debug.setupvalue) ~= "function" then return false end
+    -- 无 closure 检测 API 时也先验证可读取；只读一个槽位，避免每帧复制整张上值表。
+    if type(debug.getupvalue) == "function" then
+        local _, source, readable = app.readLuaUpvalue(func, index)
+        if not readable then return false end
+        func = source
+    else
+        local values, source = app.readLuaUpvalues(func)
+        if not values then return false end
+        func = source
+    end
+    local ok, result = app.xpcallw(debug.setupvalue, tag or "ACS upvalue write", func, index, value)
+    return ok and result ~= false, func
 end
 
 function app.getHookFunctionInfo(func)
@@ -10440,8 +10496,8 @@ function app.createFallDamageGuard()
     local control, records = {}, {}
     local stopped, nextScan, lastScope = false, 0, nil
     local function restore(fn, record)
-        if debug.getupvalue(fn, record.Slot) == record.Copy then
-            debug.setupvalue(fn, record.Slot, record.Original)
+        if app.readLuaUpvalue(fn, record.Slot) == record.Copy then
+            app.writeLuaUpvalue(fn, record.Slot, record.Original, "NoFallDmg")
         end
     end
     function control.Clear()
@@ -10455,8 +10511,8 @@ function app.createFallDamageGuard()
         local envOK, e = pcall(getfenv, fn)
         if not envOK or type(e) ~= "table" or typeof(e.script) ~= "Instance"
             or not e.script:IsDescendantOf(scope) then return end
-        local constantsOK, constants = pcall(debug.getconstants, fn)
-        if not constantsOK or type(constants) ~= "table" then return end
+        local constants = app.readLuaConstants(fn)
+        if type(constants) ~= "table" then return end
         local names = {}
         for _, value in pairs(constants) do
             if type(value) == "string" then names[value] = true end
@@ -10469,7 +10525,7 @@ function app.createFallDamageGuard()
         fn = source
         local slot, original
         for index = 1, #values do
-            local value = debug.getupvalue(fn, index)
+            local value = app.readLuaUpvalue(fn, index)
             -- Spring 等对象的 __index 会对未知字段报错；识别时只读取配置表自身字段。
             if type(value) == "table" and type(rawget(value, "EnableFallDamage")) == "boolean"
                 and type(rawget(value, "MaxVelocity")) == "number"
@@ -10482,7 +10538,7 @@ function app.createFallDamageGuard()
         local copy = setmetatable({DamageMult = 0}, {__index = original})
         local record = {Slot = slot, Original = original, Copy = copy, Script = e.script}
         records[fn] = record -- retain restoration data even if the executor throws
-        debug.setupvalue(fn, slot, copy)
+        app.writeLuaUpvalue(fn, slot, copy, "NoFallDmg")
     end
     function control.Refresh()
         if stopped then return end
@@ -10493,7 +10549,7 @@ function app.createFallDamageGuard()
         if scope ~= lastScope then lastScope, nextScan = scope, 0 end
         for fn, record in pairs(records) do
             if not scope or not record.Script:IsDescendantOf(scope)
-                or debug.getupvalue(fn, record.Slot) ~= record.Copy then
+                or app.readLuaUpvalue(fn, record.Slot) ~= record.Copy then
                 restore(fn, record)
                 records[fn] = nil
             end
@@ -10656,23 +10712,26 @@ function app.runSteadyFrame(record, status, ...)
     local observe = not record.Slot and os.clock() >= (record.NextSample or 0)
     local inspected, inspectError = pcall(function()
         if record.Slot then
-            saved = debug.getupvalue(source, record.Slot)
+            saved = app.readLuaUpvalue(source, record.Slot)
             -- A weapon/closure replacement must be learned again before writing.
             if saved ~= record.LastNative or not app.steadySmallTransform(saved) then
                 record.Slot, record.Streak = nil, nil
                 return
             end
             if record.SpeedSlot then
-                local speed = debug.getupvalue(source, record.SpeedSlot)
+                local speed = app.readLuaUpvalue(source, record.SpeedSlot)
                 if type(speed) == "number" then speeds[record.SpeedSlot] = speed end
             else
                 for index in pairs(record.SpeedCandidates or {}) do
-                    local speed = debug.getupvalue(source, index)
+                    local speed = app.readLuaUpvalue(source, index)
                     if type(speed) == "number" then speeds[index] = speed end
                 end
             end
-            debug.setupvalue(source, record.Slot, CFrame.new())
-            pinned = true
+            pinned = app.writeLuaUpvalue(source, record.Slot, CFrame.new(), "SteadyAim")
+            if not pinned then
+                record.Slot, record.Streak = nil, nil
+                status.State = "Waiting for writable Lua closure"
+            end
         elseif observe then
             record.NextSample = os.clock() + 0.1
             local values = app.readLuaUpvalues(source)
@@ -10682,7 +10741,7 @@ function app.runSteadyFrame(record, status, ...)
             local count = 0
             for index in pairs(values) do if type(index) == "number" then count = math.max(count, index) end end
             for index = 1, math.min(count, 200) do
-                local value = debug.getupvalue(source, index)
+                local value = app.readLuaUpvalue(source, index)
                 if app.steadySmallTransform(value) then before[index] = value
                 elseif type(value) == "number" and value >= 0 and value <= 128 then speeds[index] = value end
             end
@@ -10694,7 +10753,7 @@ function app.runSteadyFrame(record, status, ...)
     local endAt = tick()
     local checked, checkError = pcall(function()
         if pinned then
-            local value = debug.getupvalue(source, record.Slot)
+            local value = app.readLuaUpvalue(source, record.Slot)
             local valid, speedSlot = app.matchSteadyBob(CFrame.new(), value, startAt, endAt, speeds)
             if result[1] and valid then
                 record.LastNative = value
@@ -10704,14 +10763,14 @@ function app.runSteadyFrame(record, status, ...)
             else
                 -- A skipped/failed native update must not leave our identity in
                 -- a persistent transform. Keep native writes when it did update.
-                if value == CFrame.new() then debug.setupvalue(source, record.Slot, saved) end
+                if value == CFrame.new() then app.writeLuaUpvalue(source, record.Slot, saved, "SteadyAim") end
                 record.Slot, record.Streak = nil, nil
                 status.State = "Rechecking native bob"
             end
         elseif observe and inspected and result[1] then
             local matched, matchedSpeed, matches = nil, nil, 0
             for index, value in pairs(before) do
-                local after = debug.getupvalue(source, index)
+                local after = app.readLuaUpvalue(source, index)
                 local valid, speedSlot = app.matchSteadyBob(value, after, startAt, endAt, speeds)
                 if valid then matches += 1; matched, matchedSpeed = index, speedSlot end
             end
@@ -10721,7 +10780,7 @@ function app.runSteadyFrame(record, status, ...)
                 if record.Streak >= 4 then
                     record.Slot, record.SpeedSlot = matched, matchedSpeed
                     record.SpeedCandidates = speeds
-                    record.LastNative = debug.getupvalue(source, matched)
+                    record.LastNative = app.readLuaUpvalue(source, matched)
                     status.State = "Native bob verified"
                 end
             else record.Streak, record.Candidate = nil, nil end
@@ -10730,8 +10789,8 @@ function app.runSteadyFrame(record, status, ...)
     if not checked then
         if pinned then
             local restored, err = pcall(function()
-                if debug.getupvalue(source, record.Slot) == CFrame.new() then
-                    debug.setupvalue(source, record.Slot, saved)
+                if app.readLuaUpvalue(source, record.Slot) == CFrame.new() then
+                    app.writeLuaUpvalue(source, record.Slot, saved, "SteadyAim")
                 end
             end)
             if not restored then status.State = "Bob restore failed: " .. tostring(err) end
@@ -10808,8 +10867,8 @@ function app.createSteadyAimController()
                 else
                     local envOK, e = pcall(getfenv, fn)
                     if envOK and type(e) == "table" and (environments[e] or scripts[e.script]) then
-                        local constantsOK, constants = pcall(debug.getconstants, fn)
-                        if constantsOK and app.isSteadyRender(constants) then
+                        local constants = app.readLuaConstants(fn)
+                        if constants and app.isSteadyRender(constants) then
                             local record = {Script = e.script, Enabled = true, FromGC = gcFunctions[fn] == true}
                             local original, hook = app.installHookFunction(fn, function(...)
                                 return app.runSteadyFrame(record, status, ...)
@@ -12197,8 +12256,8 @@ function app.createImpactCapture(submit)
     local control, records = {}, {}
     local function restore(fn, record)
         record.Active = false
-        if debug.getupvalue(fn, record.Slot) == record.Copy then
-            debug.setupvalue(fn, record.Slot, record.Original)
+        if app.readLuaUpvalue(fn, record.Slot) == record.Copy then
+            app.writeLuaUpvalue(fn, record.Slot, record.Original, "ShowImpact")
         end
     end
     function control.Clear()
@@ -12218,13 +12277,13 @@ function app.createImpactCapture(submit)
                 fn = source
                 seen[fn] = true
                 local record = records[fn]
-                if record and debug.getupvalue(fn, record.Slot) ~= record.Copy then
+                if record and app.readLuaUpvalue(fn, record.Slot) ~= record.Copy then
                     restore(fn, record); records[fn] = nil; record = nil
                 end
                 if not record then
                     local slot, original
                     for index = 1, #values do
-                        local value = debug.getupvalue(fn, index)
+                        local value = app.readLuaUpvalue(fn, index)
                         if type(value) == "table" and type(rawget(value, "HitEffect")) == "function" then
                             if slot then slot = nil; break end
                             slot, original = index, value
@@ -12242,7 +12301,7 @@ function app.createImpactCapture(submit)
                             return native(...)
                         end
                         records[fn] = record
-                        debug.setupvalue(fn, slot, copy)
+                        app.writeLuaUpvalue(fn, slot, copy, "ShowImpact")
                     end
                 end
             end
@@ -13363,9 +13422,9 @@ function app.createAmmoSetupGuard()
                 restore(e, record); records[e] = nil; record = nil
             end
             if not record and type(e.setup) == "function" and type(e.loadAttachment) == "function" then
-                local ok, constants = pcall(debug.getconstants, e.setup)
+                local constants = app.readLuaConstants(e.setup)
                 local names = {}
-                if ok and type(constants) == "table" then
+                if type(constants) == "table" then
                     for _, value in pairs(constants) do if type(value) == "string" then names[value] = true end end
                 end
                 if names.RepValues and names.Mag and names.StoredAmmo and names.loadAttachment then
@@ -13544,7 +13603,7 @@ function app.restoreRapidEntry(entry)
         app.xpcallw(function()
             local ups, source = app.readLuaUpvalues(patch.func)
             if ups and ups[patch.index] == entry.copy then
-                debug.setupvalue(source, patch.index, patch.original)
+                app.writeLuaUpvalue(source, patch.index, patch.original, "RapidFire")
             end
         end, "RapidFire还原")
     end
@@ -13584,7 +13643,7 @@ function app.applyRapidFireMode()
                         seen[source] = true
                         for i, up in pairs(ups) do
                             if up == real then
-                                local written = app.xpcallw(debug.setupvalue, "RapidFire", source, i, copy)
+                                local written = app.writeLuaUpvalue(source, i, copy, "RapidFire")
                                 if written then
                                     table.insert(patches, {func = source, index = i, original = real})
                                 end
@@ -13742,7 +13801,7 @@ function app.pinInfiniteAmmo()
             -- 卡壳时钉 0:换弹守卫要求弹匣 < 弹容才放行(v2@1844),Reload 是唯一解卡途径,
             -- 满弹钉死会导致永远无法按 R 解卡;钉 0 放行换弹,解卡后下一帧恢复钉满
             local jammed = rec.settings and rawget(rec.settings, "Jammed") == true
-            debug.setupvalue(rec.func, rec.idx, jammed and 0 or (magCap + 1))
+            app.writeLuaUpvalue(rec.func, rec.idx, jammed and 0 or (magCap + 1), "InfiniteAmmo")
         end, "InfiniteAmmo")
     end
 end
@@ -13777,7 +13836,7 @@ function app.applyInstantEquip()
                 local old, record = app.installHookFunction(f, function(...)
                     if not original then return end
                     if not instantEquipEnabled then return original(...) end
-                    local written = app.xpcallw(debug.setupvalue, "InstantEquip写入", original, readyIndex, true)
+                    local written = app.writeLuaUpvalue(original, readyIndex, true, "InstantEquip")
                     if not written then return original(...) end -- 不把装备状态卡死
                 end, "InstantEquip")
                 if record then
@@ -13916,9 +13975,9 @@ function app.applyInstantAim()
                 app.instantAimBackup[e] = recs
                 for _, rec in ipairs(recs) do
                     if rec.num then
-                        debug.setupvalue(rec.f, rec.i, 0)
+                        app.writeLuaUpvalue(rec.f, rec.i, 0, "InstantAim")
                     else
-                        debug.setupvalue(rec.f, rec.i, TweenInfo.new(0, Enum.EasingStyle.Linear))
+                        app.writeLuaUpvalue(rec.f, rec.i, TweenInfo.new(0, Enum.EasingStyle.Linear), "InstantAim")
                     end
                 end
             end
@@ -13942,11 +14001,10 @@ function app.pinInstantAim()
             if rec.num then
                 local source = app.resolveLuaClosure(rec.f)
                 -- 每帧只读需要钉住的槽位，不分配整张上值表。
-                local ok, cur = false, nil
-                if source then ok, cur = pcall(debug.getupvalue, source, rec.i) end
+                local cur, _, ok = app.readLuaUpvalue(source, rec.i)
                 if ok and type(cur) == "number" and cur ~= 0 then
                     rec.v = cur
-                    debug.setupvalue(source, rec.i, 0)
+                    app.writeLuaUpvalue(source, rec.i, 0, "InstantAim")
                 end
             end
         end
@@ -13959,7 +14017,7 @@ function app.restoreInstantAim()
         for _, rec in ipairs(recs) do
             app.xpcallw(function()
                 local values, source = app.readLuaUpvalues(rec.f)
-                if values then debug.setupvalue(source, rec.i, rec.v) end
+                if values then app.writeLuaUpvalue(source, rec.i, rec.v, "InstantAim") end
             end, "InstantAim恢复")
         end
     end
@@ -15888,7 +15946,8 @@ startup.runtime.reveal = function()
     setMainGuiVisible(true)
 end
 end, function(err)
-    return debug.traceback(tostring(err), 2)
+    local report = app.captureErrorReport(err, "Startup: " .. tostring(startup.stage))
+    return report
 end)
 
 if not startupOK then
