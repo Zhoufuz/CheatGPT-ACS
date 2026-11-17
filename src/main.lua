@@ -11420,32 +11420,81 @@ app.CONFIG_EXTRA.bulletTraceEnabled = app.cheatGPTConfigValue("bulletTraceEnable
 -- CanvasGroup:显隐用 GroupTransparency 淡入淡出(同主窗口),初始位置下移避开 Roblox 顶栏
 local watermarkFrame = Instance.new("CanvasGroup")
 watermarkFrame.Name = app.randomName()
-watermarkFrame.AutomaticSize = Enum.AutomaticSize.XY
-watermarkFrame.Size = UDim2.fromOffset(0, 0)
+watermarkFrame.Size = UDim2.fromOffset(150, 36)
 watermarkFrame.Position = UDim2.new(0, 12, 0, 44)
-watermarkFrame.BackgroundColor3 = app.THEME.panel
+watermarkFrame.BackgroundTransparency = 1
 watermarkFrame.BorderSizePixel = 0
 watermarkFrame.Visible = false
 watermarkFrame.GroupTransparency = 1
 watermarkFrame.ZIndex = 500
 watermarkFrame.Parent = gui
-app.addCorner(watermarkFrame, 7)
-app.addStroke(watermarkFrame, app.THEME.line, 1, 0.35)
-
-local watermarkPadding = Instance.new("UIPadding")
-watermarkPadding.PaddingLeft = UDim.new(0, 8)
-watermarkPadding.PaddingRight = UDim.new(0, 10)
-watermarkPadding.PaddingTop = UDim.new(0, 6)
-watermarkPadding.PaddingBottom = UDim.new(0, 6)
-watermarkPadding.Parent = watermarkFrame
+-- 装饰与内容分层，阴影留在 CanvasGroup 内，随整块水印一起淡入淡出。
+-- 仅测量内容排版，避免全尺寸背景参与 AutomaticSize 造成尺寸反馈。
+do
+    local function surface(name, color, transparency, position, size, radius, z)
+        local frame = Instance.new("Frame")
+        frame.Name = name
+        frame.BackgroundColor3 = color
+        frame.BackgroundTransparency = transparency
+        frame.BorderSizePixel = 0
+        frame.Position = position
+        frame.Size = size
+        frame.ZIndex = z
+        frame.Parent = watermarkFrame
+        app.addCorner(frame, radius)
+        return frame
+    end
+    surface("ShadowOuter", Color3.new(0, 0, 0), 0.94,
+        UDim2.fromOffset(0, 5), UDim2.new(1, 0, 1, -5), 12, 500)
+    surface("ShadowMiddle", Color3.new(0, 0, 0), 0.88,
+        UDim2.fromOffset(2, 4), UDim2.new(1, -4, 1, -6), 11, 500)
+    surface("ShadowInner", Color3.new(0, 0, 0), 0.78,
+        UDim2.fromOffset(4, 3), UDim2.new(1, -8, 1, -7), 10, 500)
+    local glass = surface("FrostedSurface", Color3.new(1, 1, 1), 0.14,
+        UDim2.fromOffset(6, 2), UDim2.new(1, -12, 1, -8), 9, 501)
+    local tint = Instance.new("UIGradient")
+    tint.Rotation = 90
+    tint.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(49, 51, 58)),
+        ColorSequenceKeypoint.new(0.45, Color3.fromRGB(33, 35, 41)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(25, 27, 32)),
+    })
+    tint.Parent = glass
+    app.addStroke(glass, Color3.fromRGB(145, 151, 165), 1, 0.8)
+    local sheen = surface("SurfaceSheen", Color3.new(1, 1, 1), 0.94,
+        UDim2.fromOffset(7, 3), UDim2.new(1, -14, 1, -10), 8, 502)
+    local sheenFade = Instance.new("UIGradient")
+    sheenFade.Rotation = 100
+    sheenFade.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0),
+        NumberSequenceKeypoint.new(0.45, 0.85),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    sheenFade.Parent = sheen
+    local edge = surface("TopHighlight", Color3.new(1, 1, 1), 0.7,
+        UDim2.fromOffset(16, 2), UDim2.new(1, -32, 0, 1), 1, 503)
+    local edgeFade = Instance.new("UIGradient")
+    edgeFade.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.3, 0.2),
+        NumberSequenceKeypoint.new(0.7, 0.45), NumberSequenceKeypoint.new(1, 1),
+    })
+    edgeFade.Parent = edge
+    local content = Instance.new("Frame")
+    content.Name = "WatermarkContent"
+    content.BackgroundTransparency = 1
+    content.Position = UDim2.fromOffset(16, 8)
+    content.Size = UDim2.new(1, -32, 1, -20)
+    content.ZIndex = 504
+    content.Parent = watermarkFrame
+end
 
 local watermarkLayout = Instance.new("UIListLayout")
 watermarkLayout.FillDirection = Enum.FillDirection.Horizontal
 watermarkLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
 watermarkLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-watermarkLayout.Padding = UDim.new(0, 6)
+watermarkLayout.Padding = UDim.new(0, 7)
 watermarkLayout.SortOrder = Enum.SortOrder.LayoutOrder
-watermarkLayout.Parent = watermarkFrame
+watermarkLayout.Parent = watermarkFrame:FindFirstChild("WatermarkContent")
 
 local watermarkLogo = Instance.new("ImageLabel")
 watermarkLogo.Name = app.randomName()
@@ -11454,8 +11503,9 @@ watermarkLogo.BackgroundTransparency = 1
 watermarkLogo.BorderSizePixel = 0
 watermarkLogo.Image = "rbxassetid://93763775045380"
 watermarkLogo.ScaleType = Enum.ScaleType.Crop
-watermarkLogo.ZIndex = 501
-watermarkLogo.Parent = watermarkFrame
+watermarkLogo.ZIndex = 504
+watermarkLogo.LayoutOrder = 1
+watermarkLogo.Parent = watermarkFrame:FindFirstChild("WatermarkContent")
 app.addCorner(watermarkLogo, 4)
 
 local watermarkLabel = Instance.new("TextLabel")
@@ -11468,8 +11518,9 @@ watermarkLabel.TextColor3 = app.THEME.text
 app.applyFont(watermarkLabel, Enum.Font.GothamMedium)
 watermarkLabel.TextSize = 12
 watermarkLabel.TextXAlignment = Enum.TextXAlignment.Left
-watermarkLabel.ZIndex = 501
-watermarkLabel.Parent = watermarkFrame
+watermarkLabel.ZIndex = 504
+watermarkLabel.LayoutOrder = 2
+watermarkLabel.Parent = watermarkFrame:FindFirstChild("WatermarkContent")
 
 function app.createRollingWatermark(label)
     local cells, previous = {}, ""
@@ -11571,10 +11622,35 @@ function app.createRollingWatermark(label)
 end
 app.watermarkRollingCells = app.createRollingWatermark(watermarkLabel)
 
-app.registerResponsiveRoot(watermarkFrame, true)
-watermarkLabel:GetPropertyChangedSignal("Text"):Connect(function()
-    task.defer(app.refreshResponsiveUI)
-end)
+do
+    local scale = app.registerResponsiveRoot(watermarkFrame, true, function(viewport, wantedScale)
+        local uiScale = watermarkFrame:FindFirstChild("ResponsiveScale")
+        if uiScale then
+            uiScale.Scale = math.max(0.001, math.min(wantedScale,
+                (viewport.X - 24) / math.max(1, watermarkFrame.Size.X.Offset)))
+        end
+    end)
+    local pending = false
+    local function resize()
+        if pending then return end
+        pending = true
+        task.defer(function()
+            pending = false
+            if not watermarkFrame.Parent then return end
+            local contentSize = watermarkLayout.AbsoluteContentSize
+            local unitScale = math.max(scale.Scale, 0.001)
+            local size = UDim2.fromOffset(math.ceil(contentSize.X / unitScale - 0.001) + 32,
+                math.max(16, math.ceil(contentSize.Y / unitScale - 0.001)) + 20)
+            if watermarkFrame.Size ~= size then
+                watermarkFrame.Size = size
+                app.refreshResponsiveUI()
+            end
+        end)
+    end
+    watermarkLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(resize)
+    watermarkLabel:GetPropertyChangedSignal("Text"):Connect(resize)
+    resize()
+end
 
 watermarkFrame.Active = true
 
