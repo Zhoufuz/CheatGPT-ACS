@@ -10379,8 +10379,10 @@ function app.createFallDamageGuard()
         local slot, original
         for index = 1, #values do
             local value = debug.getupvalue(fn, index)
-            if type(value) == "table" and type(value.EnableFallDamage) == "boolean"
-                and type(value.MaxVelocity) == "number" and type(value.DamageMult) == "number" then
+            -- Spring 等对象的 __index 会对未知字段报错；识别时只读取配置表自身字段。
+            if type(value) == "table" and type(rawget(value, "EnableFallDamage")) == "boolean"
+                and type(rawget(value, "MaxVelocity")) == "number"
+                and type(rawget(value, "DamageMult")) == "number" then
                 if slot then return end -- ambiguous callback: do not guess
                 slot, original = index, value
             end
