@@ -2633,6 +2633,40 @@ end
 -- 3) Potassium 存在 debug.setinfo 时，把 source/short_src/name 对齐到 C closure 约定；
 -- 4) hookfunction 仍以原函数对象为 target，func/isfunctionhooked 由执行器维护，原函数用于恢复。
 app.HOOK_CLOSURE_RECORDS = {}
+app.HOOK_LUA_SOURCES = setmetatable({}, {__mode = "k"})
+
+-- 扫描环境时允许出现原生/C closure；上值只在已知的原始 Lua closure 上读写。
+-- 返回同一个函数供 setupvalue 和恢复记录使用，避免拿原函数的索引写入包装函数。
+function app.resolveLuaClosure(func)
+    if type(func) ~= "function" then return nil end
+    local resolved = false
+    for _ = 1, 16 do
+        local record = app.HOOK_CLOSURE_RECORDS[func]
+        local original = record and record.original or app.HOOK_LUA_SOURCES[func]
+        if not original then resolved = true; break end
+        if type(original) ~= "function" or original == func then return nil end
+        func = original
+    end
+    if not resolved then return nil end -- 拒绝循环引用的包装链
+    if type(iscclosure) == "function" then
+        local ok, native = pcall(iscclosure, func)
+        if ok and native then return nil end
+    end
+    if type(islclosure) == "function" then
+        local ok, lua = pcall(islclosure, func)
+        if ok and not lua then return nil end
+    end
+    return func
+end
+
+function app.readLuaUpvalues(func)
+    func = app.resolveLuaClosure(func)
+    if not func or type(debug) ~= "table" or type(debug.getupvalues) ~= "function" then return nil end
+    -- 执行器可能没有 closure 检测函数；这是能力探测，扫描不支持的函数不弹错误通知。
+    local ok, values = pcall(debug.getupvalues, func)
+    if ok and type(values) == "table" then return values, func end
+    return nil
+end
 
 function app.getHookFunctionInfo(func)
     if type(debug) ~= "table" or type(func) ~= "function" then
@@ -2689,6 +2723,7 @@ function app.makeHookCClosure(original, handler)
     if type(islclosure) == "function" and islclosure(replacement) then
         return nil
     end
+    app.HOOK_LUA_SOURCES[replacement] = original
     return replacement
 end
 
@@ -2711,6 +2746,7 @@ function app.installHookFunction(original, handler, tag)
         tag = tag,
     }
     app.HOOK_CLOSURE_RECORDS[original] = record
+    app.HOOK_LUA_SOURCES[replacement] = old
     return old, record
 end
 
@@ -10428,7 +10464,9 @@ function app.createFallDamageGuard()
         if not (names.EnableFallDamage and names.MaxVelocity and names.DamageMult
             and names.Freefall and names.Landed and names.FallDamage and names.InvokeServer) then return end
         -- Use indexed reads: some executors enumerate getupvalues out of order.
-        local values = debug.getupvalues(fn)
+        local values, source = app.readLuaUpvalues(fn)
+        if not values or records[source] then return end
+        fn = source
         local slot, original
         for index = 1, #values do
             local value = debug.getupvalue(fn, index)
@@ -10612,36 +10650,39 @@ end
 
 function app.runSteadyFrame(record, status, ...)
     if not app.STEADY_AIM or not record.Enabled then return record.Original(...) end
+    local source = app.resolveLuaClosure(record.Original)
+    if not source then return record.Original(...) end
     local before, speeds, saved, pinned = {}, {}, nil, false
     local observe = not record.Slot and os.clock() >= (record.NextSample or 0)
     local inspected, inspectError = pcall(function()
         if record.Slot then
-            saved = debug.getupvalue(record.Original, record.Slot)
+            saved = debug.getupvalue(source, record.Slot)
             -- A weapon/closure replacement must be learned again before writing.
             if saved ~= record.LastNative or not app.steadySmallTransform(saved) then
                 record.Slot, record.Streak = nil, nil
                 return
             end
             if record.SpeedSlot then
-                local speed = debug.getupvalue(record.Original, record.SpeedSlot)
+                local speed = debug.getupvalue(source, record.SpeedSlot)
                 if type(speed) == "number" then speeds[record.SpeedSlot] = speed end
             else
                 for index in pairs(record.SpeedCandidates or {}) do
-                    local speed = debug.getupvalue(record.Original, index)
+                    local speed = debug.getupvalue(source, index)
                     if type(speed) == "number" then speeds[index] = speed end
                 end
             end
-            debug.setupvalue(record.Original, record.Slot, CFrame.new())
+            debug.setupvalue(source, record.Slot, CFrame.new())
             pinned = true
         elseif observe then
             record.NextSample = os.clock() + 0.1
-            local values = debug.getupvalues(record.Original)
+            local values = app.readLuaUpvalues(source)
+            if not values then return end
             -- Read candidates through the same indexed API used for writes.
             -- Do not assume getupvalues array keys and getupvalue indices agree.
             local count = 0
             for index in pairs(values) do if type(index) == "number" then count = math.max(count, index) end end
             for index = 1, math.min(count, 200) do
-                local value = debug.getupvalue(record.Original, index)
+                local value = debug.getupvalue(source, index)
                 if app.steadySmallTransform(value) then before[index] = value
                 elseif type(value) == "number" and value >= 0 and value <= 128 then speeds[index] = value end
             end
@@ -10653,7 +10694,7 @@ function app.runSteadyFrame(record, status, ...)
     local endAt = tick()
     local checked, checkError = pcall(function()
         if pinned then
-            local value = debug.getupvalue(record.Original, record.Slot)
+            local value = debug.getupvalue(source, record.Slot)
             local valid, speedSlot = app.matchSteadyBob(CFrame.new(), value, startAt, endAt, speeds)
             if result[1] and valid then
                 record.LastNative = value
@@ -10663,14 +10704,14 @@ function app.runSteadyFrame(record, status, ...)
             else
                 -- A skipped/failed native update must not leave our identity in
                 -- a persistent transform. Keep native writes when it did update.
-                if value == CFrame.new() then debug.setupvalue(record.Original, record.Slot, saved) end
+                if value == CFrame.new() then debug.setupvalue(source, record.Slot, saved) end
                 record.Slot, record.Streak = nil, nil
                 status.State = "Rechecking native bob"
             end
         elseif observe and inspected and result[1] then
             local matched, matchedSpeed, matches = nil, nil, 0
             for index, value in pairs(before) do
-                local after = debug.getupvalue(record.Original, index)
+                local after = debug.getupvalue(source, index)
                 local valid, speedSlot = app.matchSteadyBob(value, after, startAt, endAt, speeds)
                 if valid then matches += 1; matched, matchedSpeed = index, speedSlot end
             end
@@ -10680,7 +10721,7 @@ function app.runSteadyFrame(record, status, ...)
                 if record.Streak >= 4 then
                     record.Slot, record.SpeedSlot = matched, matchedSpeed
                     record.SpeedCandidates = speeds
-                    record.LastNative = debug.getupvalue(record.Original, matched)
+                    record.LastNative = debug.getupvalue(source, matched)
                     status.State = "Native bob verified"
                 end
             else record.Streak, record.Candidate = nil, nil end
@@ -10689,8 +10730,8 @@ function app.runSteadyFrame(record, status, ...)
     if not checked then
         if pinned then
             local restored, err = pcall(function()
-                if debug.getupvalue(record.Original, record.Slot) == CFrame.new() then
-                    debug.setupvalue(record.Original, record.Slot, saved)
+                if debug.getupvalue(source, record.Slot) == CFrame.new() then
+                    debug.setupvalue(source, record.Slot, saved)
                 end
             end)
             if not restored then status.State = "Bob restore failed: " .. tostring(err) end
@@ -12172,14 +12213,15 @@ function app.createImpactCapture(submit)
         local seen = {}
         for _, e in ipairs(app.collectFrameworkEnvs()) do
             local fn = app.getImpactCastRay and app.getImpactCastRay(e) or e.CastRay
-            if type(fn) == "function" then
+            local values, source = app.readLuaUpvalues(fn)
+            if values then
+                fn = source
                 seen[fn] = true
                 local record = records[fn]
                 if record and debug.getupvalue(fn, record.Slot) ~= record.Copy then
                     restore(fn, record); records[fn] = nil; record = nil
                 end
                 if not record then
-                    local values = debug.getupvalues(fn)
                     local slot, original
                     for index = 1, #values do
                         local value = debug.getupvalue(fn, index)
@@ -13277,7 +13319,7 @@ end
 
 function app.findModTable(env)
     if not env or not env.setMods then return nil end
-    local ups = debug.getupvalues(env.setMods)
+    local ups = app.readLuaUpvalues(env.setMods) or {}
     for _, up in ipairs(ups) do
         if type(up) == "table" and type(rawget(up, "camRecoilMod")) == "table" then
             return up
@@ -13404,10 +13446,10 @@ function app.refreshModTables()
     table.clear(app.allModTables)
     local seen = {}
     for _, e in ipairs(app.collectFrameworkEnvs()) do
-        local ok, ups = app.xpcallw(debug.getupvalues, "refreshModTables", e.setMods)
-        if ok and ups then
+        local ups = app.readLuaUpvalues(e.setMods)
+        if ups then
             for _, up in ipairs(ups) do
-                if type(up) == "table" and type(up.camRecoilMod) == "table" and not seen[up] then
+                if type(up) == "table" and type(rawget(up, "camRecoilMod")) == "table" and not seen[up] then
                     seen[up] = true
                     table.insert(app.allModTables, up)
                 end
@@ -13483,8 +13525,8 @@ function app.rapidFindSettings(e)
     for _, name in ipairs(candidates) do
         local fn = rawget(e, name)
         if type(fn) == "function" then
-            local ok, ups = app.xpcallw(debug.getupvalues, "RapidFire识别", fn)
-            if ok and type(ups) == "table" then
+            local ups = app.readLuaUpvalues(fn)
+            if ups then
                 for _, up in pairs(ups) do
                     if type(up) == "table" and rawget(up, "ShootType") ~= nil and rawget(up, "ShootRate") ~= nil then
                         return up
@@ -13500,9 +13542,9 @@ app.rapidForgeFunctions = {} -- env -> {real, copy, patches, shadow}
 function app.restoreRapidEntry(entry)
     for _, patch in ipairs(entry and entry.patches or {}) do
         app.xpcallw(function()
-            local ups = debug.getupvalues(patch.func)
+            local ups, source = app.readLuaUpvalues(patch.func)
             if ups and ups[patch.index] == entry.copy then
-                debug.setupvalue(patch.func, patch.index, patch.original)
+                debug.setupvalue(source, patch.index, patch.original)
             end
         end, "RapidFire还原")
     end
@@ -13514,8 +13556,8 @@ function app.applyRapidFireMode()
         if old then
             local intact = true
             for _, patch in ipairs(old.patches) do
-                local ok, ups = app.xpcallw(debug.getupvalues, "RapidFire检查", patch.func)
-                if not ok or not ups or ups[patch.index] ~= old.copy then
+                local ups = app.readLuaUpvalues(patch.func)
+                if not ups or ups[patch.index] ~= old.copy then
                     intact = false
                     break
                 end
@@ -13536,15 +13578,15 @@ function app.applyRapidFireMode()
             copy.ShootType = 3
             local patches, seen = {}, {}
             for _, fn in pairs(e) do
-                if type(fn) == "function" and not seen[fn] then
-                    seen[fn] = true
-                    local ok, ups = app.xpcallw(debug.getupvalues, "RapidFire识别", fn)
-                    if ok and type(ups) == "table" then
+                if type(fn) == "function" then
+                    local ups, source = app.readLuaUpvalues(fn)
+                    if ups and not seen[source] then
+                        seen[source] = true
                         for i, up in pairs(ups) do
                             if up == real then
-                                local written = app.xpcallw(debug.setupvalue, "RapidFire", fn, i, copy)
+                                local written = app.xpcallw(debug.setupvalue, "RapidFire", source, i, copy)
                                 if written then
-                                    table.insert(patches, {func = fn, index = i, original = real})
+                                    table.insert(patches, {func = source, index = i, original = real})
                                 end
                             end
                         end
@@ -13661,8 +13703,8 @@ function app.identifyInfiniteAmmo()
     table.clear(app.infiniteAmmoCache)
     for _, e in ipairs(app.collectFrameworkEnvs()) do
         if type(e.Shoot) == "function" then
-            local okS, upsS = app.xpcallw(debug.getupvalues, "InfiniteAmmo", e.Shoot)
-            if okS and type(upsS) == "table" then
+            local upsS, source = app.readLuaUpvalues(e.Shoot)
+            if upsS then
                 local settings = app.rapidForgeReal[e] or app.rapidFindSettings(e)
                 local magCap = settings and (
                     tonumber(rawget(settings, "Ammo")) or tonumber(rawget(settings, "MaxAmmo"))
@@ -13685,7 +13727,7 @@ function app.identifyInfiniteAmmo()
                 end
                 if bestIndex then
                     app.infiniteAmmoCache[e] = {
-                        func = e.Shoot, idx = bestIndex, settings = settings, magCap = magCap,
+                        func = source, idx = bestIndex, settings = settings, magCap = magCap,
                     }
                 end
             end
@@ -13720,9 +13762,9 @@ function app.applyInstantEquip()
         if not previous and type(f) == "function" then
             -- 更新版 v1 和旧 v1/v2/v3 均只有一个直接捕获的 boolean（可行动状态）。
             -- 在 hook 前识别，不能对 hook 后的 C closure 使用原 Lua upvalue 索引。
-            local ok, upvalues = app.xpcallw(debug.getupvalues, "InstantEquip识别", f)
+            local upvalues, source = app.readLuaUpvalues(f)
             local readyIndex, count = nil, 0
-            if ok and type(upvalues) == "table" then
+            if upvalues and source == f then
                 for index, value in pairs(upvalues) do
                     if type(index) == "number" and type(value) == "boolean" then
                         readyIndex = index
@@ -13771,7 +13813,7 @@ function app.findAcsSettings(e)
     for _, fname in ipairs({"Shoot", "CastRay"}) do
         local f = rawget(e, fname)
         if type(f) == "function" then
-            for _, uv in ipairs(debug.getupvalues(f)) do
+            for _, uv in ipairs(app.readLuaUpvalues(f) or {}) do
                 if type(uv) == "table" and rawget(uv, "ShootType") ~= nil and rawget(uv, "ShootRate") ~= nil then
                     return uv
                 end
@@ -13836,12 +13878,14 @@ function app.applyInstantAim()
             continue
         end
         if not app.instantAimBackup[e] then
-            local recs = {}
+            local recs, scanned = {}, {}
             for _, v in pairs(e) do
-                if type(v) == "function" then
-                    for i, uv in ipairs(debug.getupvalues(v)) do
+                local values, source = app.readLuaUpvalues(v)
+                if values and not scanned[source] then
+                    scanned[source] = true
+                    for i, uv in ipairs(values) do
                         if typeof(uv) == "TweenInfo" and uv.Time > 0 then
-                            table.insert(recs, {f = v, i = i, v = uv, num = false})
+                            table.insert(recs, {f = source, i = i, v = uv, num = false})
                         end
                     end
                 end
@@ -13851,11 +13895,14 @@ function app.applyInstantAim()
                 local settings = app.findAcsSettings(e)
                 local aimSpeed = settings and rawget(settings, "AimZoomSpeed") or 0.3
                 if type(aimSpeed) == "number" and aimSpeed > 0 and aimSpeed % 1 ~= 0 then
+                    table.clear(scanned)
                     for _, v in pairs(e) do
-                        if type(v) == "function" then
-                            for i, uv in ipairs(debug.getupvalues(v)) do
+                        local values, source = app.readLuaUpvalues(v)
+                        if values and not scanned[source] then
+                            scanned[source] = true
+                            for i, uv in ipairs(values) do
                                 if type(uv) == "number" and math.abs(uv - aimSpeed) < 1e-6 then
-                                    table.insert(recs, {f = v, i = i, v = uv, num = true})
+                                    table.insert(recs, {f = source, i = i, v = uv, num = true})
                                 end
                             end
                         end
@@ -13893,10 +13940,13 @@ function app.pinInstantAim()
     for _, recs in pairs(app.instantAimBackup) do
         for _, rec in ipairs(recs) do
             if rec.num then
-                local cur = debug.getupvalue(rec.f, rec.i)
-                if type(cur) == "number" and cur ~= 0 then
+                local source = app.resolveLuaClosure(rec.f)
+                -- 每帧只读需要钉住的槽位，不分配整张上值表。
+                local ok, cur = false, nil
+                if source then ok, cur = pcall(debug.getupvalue, source, rec.i) end
+                if ok and type(cur) == "number" and cur ~= 0 then
                     rec.v = cur
-                    debug.setupvalue(rec.f, rec.i, 0)
+                    debug.setupvalue(source, rec.i, 0)
                 end
             end
         end
@@ -13908,7 +13958,8 @@ function app.restoreInstantAim()
     for e, recs in pairs(app.instantAimBackup) do
         for _, rec in ipairs(recs) do
             app.xpcallw(function()
-                debug.setupvalue(rec.f, rec.i, rec.v)
+                local values, source = app.readLuaUpvalues(rec.f)
+                if values then debug.setupvalue(source, rec.i, rec.v) end
             end, "InstantAim恢复")
         end
     end
@@ -14015,8 +14066,8 @@ function app.getAccessId(env)
     if app.isBallisticFramework(env) then
         local cast = app.getImpactCastRay and app.getImpactCastRay(env) or env.CastRay
         if type(cast) == "function" then
-            local ok, values = pcall(debug.getupvalues, cast)
-            if ok and type(values) == "table" then
+            local values = app.readLuaUpvalues(cast)
+            if values then
                 for _, value in pairs(values) do
                     if type(value) == "string" and value:match("^%x+%-%x+%-%x+%-%x+%-%x+$") then return value end
                 end
@@ -14039,7 +14090,7 @@ function app.getAccessId(env)
         end
     end
     if env and env.CastRay then
-        local ups = debug.getupvalues(env.CastRay)
+        local ups = app.readLuaUpvalues(env.CastRay) or {}
         for _, up in ipairs(ups) do
             if type(up) == "string" and (up:match("%x+%-%x+%-%x+%-%x+%-%x+") or up:match("%x+")) then
                 return up
@@ -14047,7 +14098,7 @@ function app.getAccessId(env)
         end
     end
     if env and env.Shoot then
-        local ups = debug.getupvalues(env.Shoot)
+        local ups = app.readLuaUpvalues(env.Shoot) or {}
         for _, up in ipairs(ups) do
             if type(up) == "string" and (up:match("%x+%-%x+%-%x+%-%x+%-%x+") or up:match("%x+")) then
                 return up
@@ -15390,11 +15441,11 @@ do
         local framework = state.scopeEnv
         local fn = type(framework) == "table" and framework.SetAimpart
         if type(fn) ~= "function" or type(debug.getupvalues) ~= "function" then return false end
-        local ok, values = pcall(debug.getupvalues, fn)
-        if ok and type(values) == "table" and app.isBallisticFramework(framework) then
+        local values = app.readLuaUpvalues(fn)
+        if values and app.isBallisticFramework(framework) then
             return app.readBallisticScope(values) == true
         end
-        if not ok or type(values) ~= "table" or type(values[1]) ~= "boolean"
+        if not values or type(values[1]) ~= "boolean"
             or (values[2] ~= 1 and values[2] ~= 2) or typeof(values[3]) ~= "Instance" then return false end
         if not values[3]:FindFirstChild("AimPart") and not values[3]:FindFirstChild("AimPart2") then return false end
         return values[1]
