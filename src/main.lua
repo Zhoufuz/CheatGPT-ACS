@@ -2779,6 +2779,41 @@ function app.getHookCallStack(offset)
     return ok and stack or nil
 end
 
+-- 变体 5 使用 Ballistics、六参数 CastRay、CycleWait 和精简命中载荷。
+function app.isBallisticFramework(e)
+    return type(e) == "table" and type(rawget(e, "NewShot")) == "function"
+        and type(rawget(e, "CycleWait")) == "function"
+        and type(rawget(e, "HitStats")) == "function" and type(rawget(e, "HitMods")) == "function"
+        and type(rawget(e, "Ballistics")) == "table"
+end
+
+function app.readBallisticScope(values)
+    local aiming, count, hasModel, hasSettings, hasSight = nil, 0, false, false, false
+    for _, value in pairs(values) do
+        if type(value) == "boolean" then
+            aiming, count = value, count + 1
+        elseif typeof(value) == "Instance" then
+            if value:FindFirstChild("AimPart") or value:FindFirstChild("AimPart2") then hasModel = true end
+        elseif type(value) == "table" then
+            if rawget(value, "Type") == "Gun" and type(rawget(value, "ShootRate")) == "number" then hasSettings = true end
+        elseif value == 1 or value == 2 then
+            hasSight = true
+        end
+    end
+    if count == 1 and hasModel and hasSettings and hasSight then return aiming end
+    return nil
+end
+
+function app.captureFrameworkShot(record, ballistic, _, origin, context, drop, muzzle, shot)
+    record.fromFramework = true
+    record.origin, record.context = origin, context
+    if ballistic then
+        record.ballistic = true
+        record.origin, record.shotOrigin, record.velocity = muzzle, origin, context
+        record.shot = shot
+    end
+end
+
 -- 所有 ACS 环境入口共用候选列表，兼容 LocalScript 本体及任意容器内的嵌套脚本。
 function app.collectACSScripts()
     local candidates = {}
@@ -4108,6 +4143,7 @@ local function createModernToggle(parent, text, defaultValue, callback, keybindI
     local initialApplied = false
     local executorDisabled = false   -- 执行器缺函数禁用态:不允许开启
     local executorMissing = nil      -- 缺失函数名列表(点击时提示)
+    local runtimeUnavailable = nil
 
     local holder = Instance.new("Frame")
     holder.Name = app.randomName()
@@ -4164,12 +4200,16 @@ local function createModernToggle(parent, text, defaultValue, callback, keybindI
 
     function api.Set(v, silent)
         local newState = v and true or false
-        if newState and executorDisabled then
+        if newState and (executorDisabled or runtimeUnavailable) then
             -- 禁用态:强制保持关并提示缺失函数(开关点击/按键绑定/程序调用统一在此拦截)
             state = false
             refresh(true)
-            if not silent and executorMissing then
-                app.notifyUnsupportedFunc(executorMissing)
+            if not silent then
+                if runtimeUnavailable then
+                    app.showNotification("CheatGPT.cc", runtimeUnavailable, 8)
+                elseif executorMissing then
+                    app.notifyUnsupportedFunc(executorMissing)
+                end
             end
             return
         end
@@ -4207,6 +4247,14 @@ local function createModernToggle(parent, text, defaultValue, callback, keybindI
         executorMissing = missing
         state = false
         refresh(false)
+        label.TextTransparency = 0.55
+        toggleBtn.BackgroundTransparency = 0.45
+        knob.BackgroundTransparency = 0.45
+    end
+
+    function api.SetRuntimeUnavailable(reason)
+        runtimeUnavailable = reason
+        api.Set(false)
         label.TextTransparency = 0.55
         toggleBtn.BackgroundTransparency = 0.45
         knob.BackgroundTransparency = 0.45
@@ -9770,7 +9818,7 @@ do
     })
 end
 
--- Bullet Trace / Accelerate Muzzle Velocity：四变体共享 CastRay 发射入口，容器监听负责兜底。
+-- Bullet Trace / Accelerate Muzzle Velocity：五变体共享 CastRay 发射入口，容器监听负责兜底。
 -- 不枚举 GC、不 hook CreateBullet：避免把扫描到的原函数备份再次 hook 成递归链。
 do
     local bulletTraceEnabled = app.cheatGPTConfigValue("bulletTraceEnabled", false)
@@ -9951,11 +9999,17 @@ do
         if typeof(part) ~= "Instance" or not part:IsA("Part") then return end
         if record.fromFramework then
             -- 游戏线程只传递引用；实例和相机的读取必须在本脚本的消费者线程内执行。
-            local context = record.context
-            record.shotOrigin = type(context) == "table" and context[1]
-                or (Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.Position)
-            if type(context) == "table" and validVector(context[2]) and context[2].Magnitude > 0 then
-                record.direction = context[2].Unit
+            if record.ballistic then
+                if not validVector(record.origin) or not validVector(record.shotOrigin)
+                    or not validVector(record.velocity) or record.velocity.Magnitude < 0.001 then return end
+                record.direction = record.velocity.Unit
+            else
+                local context = record.context
+                record.shotOrigin = type(context) == "table" and context[1]
+                    or (Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.Position)
+                if type(context) == "table" and validVector(context[2]) and context[2].Magnitude > 0 then
+                    record.direction = context[2].Unit
+                end
             end
         end
         if part.Name:sub(-6) == "_Laser" then return end
@@ -10005,7 +10059,7 @@ do
         if selfBullet and muzzleBoostEnabled and record.fromFramework and not record.cancelAcceleration then
             if app.doInstantHit(part, showTrace, origin, direction, record.shotOrigin, function()
                 record.claimed = true -- 销毁后立即通知入口，不等待 InvokeServer 返回。
-            end) then return end
+            end, record.shot) then return end
         end
         if not showTrace then return end
         drawShot(record, selfBullet)
@@ -10130,13 +10184,12 @@ do
         restoreBridge()
         if type(current.CastRay) ~= "function" then return end
         local original = current.CastRay
+        local ballistic = app.isBallisticFramework(current)
         local wrapper = function(...)
-            local part, origin, context = ...
+            local part = ...
             local record = enqueueBullet(part)
             if record then
-                record.fromFramework = true
-                record.origin = origin
-                record.context = context
+                app.captureFrameworkShot(record, ballistic, ...)
                 if muzzleBoostEnabled then
                     -- 让执行器自己的 Heartbeat 消费队列先处理；原版飞行循环尚未开始。
                     -- 超时/关开关/队列异常均放行原版，绝不永久阻塞开枪。
@@ -10827,7 +10880,7 @@ do
     local weapons = app.createLocalWeaponOptions()
     local steady = app.createSteadyAimController()
     app.refreshSteadyAim = steady.Refresh
-    app.gateExecutorToggle(createModernToggle(localBody, "No Fall Dmg", app.NO_FALL_DMG, function(value)
+    app.noFallDmgControl = app.gateExecutorToggle(createModernToggle(localBody, "No Fall Dmg", app.NO_FALL_DMG, function(value)
         app.NO_FALL_DMG = value
         app.xpcallw(fallDamage.Refresh, "No Fall Dmg")
     end), "getconnections/getgc", "getfenv", "debug.getconstants", "debug.getupvalues", "debug.getupvalue", "debug.setupvalue")
@@ -13226,7 +13279,7 @@ function app.findModTable(env)
     if not env or not env.setMods then return nil end
     local ups = debug.getupvalues(env.setMods)
     for _, up in ipairs(ups) do
-        if type(up) == "table" and up.camRecoilMod and type(up.camRecoilMod) == "table" then
+        if type(up) == "table" and type(rawget(up, "camRecoilMod")) == "table" then
             return up
         end
     end
@@ -13513,7 +13566,54 @@ function app.applyRapidFireMode()
     end
 end
 
+-- CycleWait 在变体 5 中直接等待 Heartbeat，不经过 wait(60/ShootRate)。
+-- 环境入口替换可还原，且每轮至少 yield 一帧，避免全自动忙循环卡住客户端。
+app.rapidCycleWaits = {}
+function app.restoreRapidCycleWaits()
+    for e, record in pairs(app.rapidCycleWaits) do
+        if e.CycleWait == record.Wrapper then
+            app.ensureTableWritable(e)
+            e.CycleWait = record.Original
+        end
+        app.rapidCycleWaits[e] = nil
+    end
+end
+
+function app.refreshRapidCycleWaits()
+    local seen = {}
+    for _, e in ipairs(app.collectFrameworkEnvs()) do
+        if app.isBallisticFramework(e) then
+            seen[e] = true
+            local record = app.rapidCycleWaits[e]
+            if not record or e.CycleWait ~= record.Wrapper then
+                local original = e.CycleWait
+                local wrapper = app.makeHookCClosure(original, function(...)
+                    if not rapidFireEnabled then return original(...) end
+                    task.wait(60 / app.RAPID_FIRE_RATE)
+                    return os.clock()
+                end)
+                if wrapper then
+                    app.ensureTableWritable(e)
+                    e.CycleWait = wrapper
+                    app.rapidCycleWaits[e] = {Original = original, Wrapper = wrapper}
+                end
+            end
+        end
+    end
+    for e, record in pairs(app.rapidCycleWaits) do
+        if not seen[e] then
+            if e.CycleWait == record.Wrapper then
+                app.ensureTableWritable(e)
+                e.CycleWait = record.Original
+            end
+            app.rapidCycleWaits[e] = nil
+        end
+    end
+end
+gui.Destroying:Connect(app.restoreRapidCycleWaits)
+
 function app.restoreRapidFireMode()
+    app.restoreRapidCycleWaits()
     for e, entry in pairs(app.rapidForgeFunctions) do
         app.restoreRapidEntry(entry)
         app.rapidForgeFunctions[e] = nil
@@ -13681,8 +13781,60 @@ function app.findAcsSettings(e)
     return nil
 end
 
+-- 变体 5 的开镜由 AdsMotion.Step/Follow/Fov 驱动，不再扫描无关 TweenInfo。
+app.instantAimMotionBackup = {}
+function app.restoreInstantAimMotion()
+    for e, record in pairs(app.instantAimMotionBackup) do
+        if e.AdsMotion == record.Copy then
+            app.ensureTableWritable(e)
+            e.AdsMotion = record.Original
+        end
+        app.instantAimMotionBackup[e] = nil
+    end
+end
+
+function app.applyInstantAimMotion(e)
+    local previous = app.instantAimMotionBackup[e]
+    if previous and e.AdsMotion == previous.Copy then return end
+    app.instantAimMotionBackup[e] = nil
+    local original = rawget(e, "AdsMotion")
+    if type(original) ~= "table" or type(rawget(original, "Step")) ~= "function"
+        or type(rawget(original, "Follow")) ~= "function" or type(rawget(original, "Fov")) ~= "function"
+        or type(rawget(original, "P")) ~= "number" or type(rawget(original, "Z")) ~= "number" then return end
+    local copy = table.clone(original)
+    copy.Step = function(dt, aiming, adsTime)
+        if not instantAimEnabled then return original.Step(dt, aiming, adsTime) end
+        -- 保留模块自身状态供 Reset/SightOffset 及关闭后的原生动画继续使用。
+        app.ensureTableWritable(original)
+        original.P, original.Z = aiming and 1 or 0, aiming and 1 or 0
+        original.V, original.Transit = 0, 0
+        return original.Step(dt, aiming, adsTime)
+    end
+    copy.Follow = function(...)
+        if instantAimEnabled then return 1 end
+        return original.Follow(...)
+    end
+    copy.Fov = function(dt, base, zoom, alpha)
+        if instantAimEnabled and zoom then
+            app.ensureTableWritable(original)
+            original.AimFov = zoom
+        end
+        return original.Fov(dt, base, zoom, alpha)
+    end
+    app.ensureTableWritable(e)
+    e.AdsMotion = copy
+    app.instantAimMotionBackup[e] = {Original = original, Copy = copy}
+end
+gui.Destroying:Connect(app.restoreInstantAimMotion)
+
 function app.applyInstantAim()
+    local seen = {}
     for _, e in ipairs(app.collectFrameworkEnvs()) do
+        seen[e] = true
+        if app.isBallisticFramework(e) then
+            app.applyInstantAimMotion(e)
+            continue
+        end
         if not app.instantAimBackup[e] then
             local recs = {}
             for _, v in pairs(e) do
@@ -13725,6 +13877,15 @@ function app.applyInstantAim()
             end
         end
     end
+    for e, record in pairs(app.instantAimMotionBackup) do
+        if not seen[e] then
+            if e.AdsMotion == record.Copy then
+                app.ensureTableWritable(e)
+                e.AdsMotion = record.Original
+            end
+            app.instantAimMotionBackup[e] = nil
+        end
+    end
 end
 
 -- v3 的瞄准时间上值会在每次装备时被 setup 重写,周期性重钉 0(并刷新备份值,关闭时还原到最新)
@@ -13743,6 +13904,7 @@ function app.pinInstantAim()
 end
 
 function app.restoreInstantAim()
+    app.restoreInstantAimMotion()
     for e, recs in pairs(app.instantAimBackup) do
         for _, rec in ipairs(recs) do
             app.xpcallw(function()
@@ -13836,6 +13998,7 @@ function app.refreshRapidFire()
         app.rapidExpectedInterval = 60 / sr
     end
     app.installRapidFireWaitHook()
+    app.refreshRapidCycleWaits()
     app.applyRapidFireMode()
 end
 
@@ -13849,11 +14012,25 @@ task.spawn(function()
 end)
 
 function app.getAccessId(env)
+    if app.isBallisticFramework(env) then
+        local cast = app.getImpactCastRay and app.getImpactCastRay(env) or env.CastRay
+        if type(cast) == "function" then
+            local ok, values = pcall(debug.getupvalues, cast)
+            if ok and type(values) == "table" then
+                for _, value in pairs(values) do
+                    if type(value) == "string" and value:match("^%x+%-%x+%-%x+%-%x+%-%x+$") then return value end
+                end
+            end
+        end
+    end
     local Events = ReplicatedStorage:FindFirstChild("ACS_Engine") and ReplicatedStorage.ACS_Engine:FindFirstChild("Events")
     if Events then
         local acessRemote = Events:FindFirstChild("AcessId") or Events:FindFirstChild("AccessId")
         if acessRemote and acessRemote:IsA("RemoteFunction") then
             local success, result = app.xpcallw(function()
+                if app.isBallisticFramework(env) then
+                    return acessRemote:InvokeServer(LocalPlayer.UserId, LocalPlayer.Character)
+                end
                 return acessRemote:InvokeServer(LocalPlayer.UserId)
             end, "getAccessId")
             if success and type(result) == "string" then
@@ -13895,6 +14072,10 @@ environmentLoaded = app.initEnvironment()
 if not environmentLoaded then
     error("ACS 已识别，但 modTable 或 AccessId 未就绪。请重新进入服务器后重试。", 0)
 end
+if app.isBallisticFramework(env) and app.noFallDmgControl then
+    app.noFallDmgControl.SetRuntimeUnavailable(
+        "No Fall Dmg is unavailable for ACS variant 5: its client only renders fall feedback; no client damage call is exposed.")
+end
 if not firstSuccessShown then
     app.showNotification("CheatGPT.cc", "ACS 环境加载成功", 3)
     firstSuccessShown = true
@@ -13907,8 +14088,9 @@ app.suppressionRemote = Events and Events:FindFirstChild("Suppression")
 local isDamageFunction = Damage and Damage:IsA("RemoteFunction")
 
 -- 已更新样本：变体 1 的姿态函数组 + 无 CreateShell 对应 10 参数；2/3 为 9 参数；
--- 变体 4 的 recapSpot/hitRegion 对应 14 参数。未知框架保留旧的 9 参数路径。
+-- 变体 4 的 recapSpot/hitRegion 对应 14 参数；变体 5 的第 10 参数为命中坐标。
 function app.getDamageArgumentCount()
+    if app.isBallisticFramework(env) then return 10 end
     if env and type(env.recapSpot) == "function" and type(env.hitRegion) == "function" then return 14 end
     if env and type(env.HighReady) == "function" and type(env.LowReady) == "function"
         and type(env.Patrol) == "function" and type(env.CreateShell) ~= "function" then return 10 end
@@ -13918,6 +14100,16 @@ end
 function app.buildDamageArgs(weapon, humanoid, distance, zone, config, hitPart, hitPos, shotOrigin, shotDirection)
     if not hitPart or not hitPart.Parent or not modTable or not accessId then return nil end
     local count = app.getDamageArgumentCount()
+    if app.isBallisticFramework(env) then
+        if typeof(hitPos) ~= "Vector3" then return nil end
+        if typeof(shotOrigin) == "Vector3" then distance = (hitPos - shotOrigin).Magnitude end
+        local ok, stats, mods, region = app.xpcallw(function()
+            return env.HitStats(), env.HitMods(), env.Ballistics.Zone(hitPart)
+        end, "Ballistics命中载荷")
+        if not ok or type(stats) ~= "table" or type(mods) ~= "table" or not region then return nil end
+        return table.pack(weapon, humanoid, distance, region, stats, mods,
+            nil, nil, accessId .. "-" .. LocalPlayer.UserId, hitPos)
+    end
     if count == 14 then
         local ok, region = app.xpcallw(env.hitRegion, "Damage区域", hitPart)
         if not ok or not region then return nil end
@@ -14090,6 +14282,7 @@ app.instantHitArmorParentNames = {
 
 -- 命中部位分区：变体 4 使用框架 hitRegion，其余保留旧版分区。
 function app.instantHitZone(inst)
+    if app.isBallisticFramework(env) then return env.Ballistics.Zone(inst) end
     if app.getDamageArgumentCount() == 14 then return env.hitRegion(inst) or 2 end
     local n = inst.Name
     local pn = inst.Parent and inst.Parent.Name or ""
@@ -14102,7 +14295,19 @@ function app.instantHitZone(inst)
     return 2
 end
 
-function app.doInstantHit(part, showTrace, launchOrigin, launchDirection, cameraOrigin, onClaim)
+function app.emitInstantImpact(hitPos, hitPart, normal, material, config, ballistic, shot)
+    app.xpcallw(function()
+        local event = Events and Events:FindFirstChild("HitEffect")
+        if not event then return end
+        if ballistic then
+            event:FireServer(hitPos, hitPart, normal, material, nil, type(shot) == "table" and shot.Id or nil)
+        else
+            event:FireServer(hitPos, hitPart, normal, material, app.getDamageArgumentCount() == 14 and {} or config)
+        end
+    end, "InstantHit")
+end
+
+function app.doInstantHit(part, showTrace, launchOrigin, launchDirection, cameraOrigin, onClaim, shot)
     if not part or not part.Parent then return end
     local origin = launchOrigin or part.Position
     local velocity = part.AssemblyLinearVelocity
@@ -14116,6 +14321,7 @@ function app.doInstantHit(part, showTrace, launchOrigin, launchDirection, camera
     local direction = launchDirection or ((velocity and velocity.Magnitude >= 1) and velocity.Unit)
     if not direction then return false end
     local shotOrigin = cameraOrigin or (Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.Position) or origin
+    local ballistic = app.isBallisticFramework(env) and env.Ballistics or nil
     -- 依赖就绪后才接管；否则保留游戏子弹，避免初始化/换枪期间吞掉正常射击。
     if not app.xpcallw(function() part:Destroy() end, "InstantHit") then return false end
     if onClaim then onClaim() end
@@ -14129,16 +14335,34 @@ function app.doInstantHit(part, showTrace, launchOrigin, launchDirection, camera
     local rayParamsInstant = RaycastParams.new()
     rayParamsInstant.FilterType = Enum.RaycastFilterType.Exclude
     rayParamsInstant.IgnoreWater = true
-    local rayOrigin = origin
+    local rayOrigin = ballistic and shotOrigin or origin
+    local maxRange = ballistic and tonumber(ballistic.MAX_RANGE) or 7000
+    maxRange = maxRange or 7000
     local hitPart, hitPos, hitNormal, hitMaterial = nil, nil, nil, nil
-    for _ = 1, 16 do
+    for _ = 1, (ballistic and 64 or 16) do
         rayParamsInstant.FilterDescendantsInstances = ignore
-        local result = Workspace:Raycast(rayOrigin, direction * 7000, rayParamsInstant)
+        local travelled = (rayOrigin - (ballistic and shotOrigin or origin)).Magnitude
+        local result = Workspace:Raycast(rayOrigin, direction * math.max(0, maxRange - travelled), rayParamsInstant)
         if not result then break end
         local inst = result.Instance
         local pn = inst.Parent and inst.Parent.Name or ""
         local passThrough = false
-        if inst.Parent and (inst.Parent:IsA("Accessory") or inst.Parent:IsA("Hat")) then
+        if ballistic then
+            local glass = rawget(env, "BreakableGlass")
+            local isGlass = type(glass) == "table" and type(glass.Is) == "function" and glass.Is(inst)
+            if isGlass then
+                app.emitInstantImpact(result.Position, inst, result.Normal, result.Material, weaponConfig, true, shot)
+            end
+            passThrough = isGlass or ballistic.PassesThrough(inst)
+            if not passThrough and inst.Name == "Head" and ballistic.HumanoidOf(inst) then
+                local position = ballistic.HeadPoint(inst, result.Position, direction)
+                if position then
+                    hitPart, hitPos, hitNormal, hitMaterial = inst, position, result.Normal, result.Material
+                    break
+                end
+                passThrough = true
+            end
+        elseif inst.Parent and (inst.Parent:IsA("Accessory") or inst.Parent:IsA("Hat")) then
             passThrough = true
         elseif inst.Name == "Ignorable" or inst.Name == "Glass" or inst.Name == "Ignore" or app.instantHitArmorParentNames[pn] then
             passThrough = true
@@ -14156,9 +14380,17 @@ function app.doInstantHit(part, showTrace, launchOrigin, launchDirection, camera
         end
     end
 
+    if ballistic and type(env.RoundHead) == "function" then
+        local nativeResult = hitPart and {Instance = hitPart, Position = hitPos, Normal = hitNormal, Material = hitMaterial}
+        local result, position = env.RoundHead(shotOrigin, direction * maxRange, nativeResult, hitPos)
+        if result then
+            hitPart, hitPos, hitNormal, hitMaterial = result.Instance, position, result.Normal, result.Material
+        end
+    end
+
     -- 未命中任何东西:beam 画到弹道尽头,无伤害
     if not hitPart then
-        if showTrace then app.createForwardBeamToPoint(origin, origin + direction * 7000) end
+        if showTrace then app.createForwardBeamToPoint(origin, origin + direction * maxRange) end
         return true
     end
 
@@ -14167,18 +14399,13 @@ function app.doInstantHit(part, showTrace, launchOrigin, launchDirection, camera
     if app.recordImpact then app.recordImpact(hitPos) end
 
     -- 冲击特效(与原版一致转发服务器,其他玩家也能看到血花/火花)
-    app.xpcallw(function()
-        local hitEffect = Events and Events:FindFirstChild("HitEffect")
-        if hitEffect then
-            hitEffect:FireServer(hitPos, hitPart, hitNormal, hitMaterial, app.getDamageArgumentCount() == 14 and {} or weaponConfig)
-        end
-    end, "InstantHit")
+    app.emitInstantImpact(hitPos, hitPart, hitNormal, hitMaterial, weaponConfig, ballistic, shot)
 
     -- 命中角色:构造对应变体的参数,weaponConfig/modTable 保持原表。
     local model = hitPart:FindFirstAncestorOfClass("Model")
-    local humanoid = model and model:FindFirstChildOfClass("Humanoid")
+    local humanoid = ballistic and ballistic.HumanoidOf(hitPart) or (model and model:FindFirstChildOfClass("Humanoid"))
     if humanoid and humanoid.Health > 0 then
-        local distance = (hitPos - origin).Magnitude
+        local distance = (hitPos - (ballistic and shotOrigin or origin)).Magnitude
         local zone = app.instantHitZone(hitPart)
         local targetPlayer = Players:GetPlayerFromCharacter(model)
         local cancelWatch = targetPlayer and createDamageWatch(targetPlayer, hitPart.Name, distance, zone == 1) or function() end
@@ -15164,6 +15391,9 @@ do
         local fn = type(framework) == "table" and framework.SetAimpart
         if type(fn) ~= "function" or type(debug.getupvalues) ~= "function" then return false end
         local ok, values = pcall(debug.getupvalues, fn)
+        if ok and type(values) == "table" and app.isBallisticFramework(framework) then
+            return app.readBallisticScope(values) == true
+        end
         if not ok or type(values) ~= "table" or type(values[1]) ~= "boolean"
             or (values[2] ~= 1 and values[2] ~= 2) or typeof(values[3]) ~= "Instance" then return false end
         if not values[3]:FindFirstChild("AimPart") and not values[3]:FindFirstChild("AimPart2") then return false end
