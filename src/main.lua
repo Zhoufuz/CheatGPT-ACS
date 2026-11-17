@@ -2401,8 +2401,7 @@ app.DEFAULT_CONFIG.watermarkSelection = {FPS = true, PING = true, PLAYERS = fals
 app.DEFAULT_CONFIG.watermarkOrder = {"FPS", "PING"}
 app.loadCheatGPTState()
 app.lifetimeStats = app.createLifetimeStats()
-app.CONFIG_LOADING = false
-app.scheduleCheatGPTSave()
+-- 保持加载态，直到控件回调和 ACS 运行依赖全部就绪。
 
 local tracesFolder
 local secureParent
@@ -4000,6 +3999,23 @@ end)
 
 -- 控件重置注册表：默认值来自读取 Config.yaml 之前的快照。
 app.CONFIG_CONTROLS = {}
+app.CONFIG_EFFECTS_READY = false
+
+function app.activateConfiguredToggles()
+    if app.CONFIG_EFFECTS_READY then return end
+    app.CONFIG_EFFECTS_READY = true
+    for _, rec in ipairs(app.CONFIG_CONTROLS) do
+        if rec.Kind == "toggle" then
+            -- 单个功能等待角色或报错，不能阻塞其余功能的配置恢复。
+            task.spawn(function()
+                if gui.Parent then
+                    app.xpcallw(rec.Api.ApplyInitial, "Apply configuration: " .. rec.Key)
+                end
+            end)
+        end
+    end
+end
+
 function app.copyConfigValue(value)
     if type(value) ~= "table" then return value end
     local copy = {}
@@ -4089,6 +4105,7 @@ end
 local function createModernToggle(parent, text, defaultValue, callback, keybindId, swatches, configKey)
     local state = defaultValue and true or false
     local internalUpdating = false
+    local initialApplied = false
     local executorDisabled = false   -- 执行器缺函数禁用态:不允许开启
     local executorMissing = nil      -- 缺失函数名列表(点击时提示)
 
@@ -4159,12 +4176,24 @@ local function createModernToggle(parent, text, defaultValue, callback, keybindI
         state = newState
         refresh(true)
 
-        if not silent and callback and not internalUpdating then
+        if app.CONFIG_EFFECTS_READY and not silent and callback and not internalUpdating then
             internalUpdating = true
             local ok, err = pcall(callback, state)
             internalUpdating = false
             if not ok then error(err, 0) end
+            initialApplied = true
             app.markCheatGPTConfigDirty()
+        end
+    end
+
+    function api.ApplyInitial()
+        if initialApplied then return end
+        -- 缺权限被门禁关闭的已保存开关也要同步 false 到功能变量。
+        -- 默认关闭且从未启用的功能不用执行还原，避免覆盖游戏自身状态。
+        if state or defaultValue then
+            api.Set(state)
+        else
+            initialApplied = true
         end
     end
 
@@ -10878,8 +10907,7 @@ end), "getsenv", "debug.getupvalues")
 local rapidFireToggleControl = app.gateExecutorToggle(createModernToggle(localBody, "Rapid Fire", rapidFireEnabled, function(v)
     rapidFireEnabled = v
     if v then
-        app.xpcallw(app.installRapidFireWaitHook, "RapidFire")
-        app.xpcallw(app.applyRapidFireMode, "RapidFire")
+        app.xpcallw(app.refreshRapidFire, "RapidFire")
     else
         app.xpcallw(app.restoreRapidFireMode, "RapidFire还原")
     end
@@ -13791,25 +13819,29 @@ function app.installRapidFireWaitHook()
     }
 end
 
--- Rapid Fire 周期维护(0.5s):刷新 ACS 脚本集合 + 当前武器射击间隔期望值 + 重挂 ShootType 副本
+-- 启用与维护共用完整入口：既恢复全自动，也安装/重试射速 hook。
+function app.refreshRapidFire()
+    if not rapidFireEnabled then return end
+    table.clear(app.rapidAcsScripts)
+    for _, scriptObj in ipairs(app.collectACSScripts()) do
+        app.rapidAcsScripts[scriptObj] = true
+    end
+    app.rapidExpectedInterval = nil
+    local w = app.getCurrentWeapon and app.getCurrentWeapon()
+    local cfg = w and app.getWeaponConfig and app.getWeaponConfig(w)
+    local sr = cfg and tonumber(cfg.ShootRate)
+    if sr and sr > 0 then
+        app.rapidExpectedInterval = 60 / sr
+    end
+    app.installRapidFireWaitHook()
+    app.applyRapidFireMode()
+end
+
 task.spawn(function()
-    while true do
+    while gui.Parent do
         task.wait(0.5)
-        if rapidFireEnabled then
-            table.clear(app.rapidAcsScripts)
-            for _, scriptObj in ipairs(app.collectACSScripts()) do
-                app.rapidAcsScripts[scriptObj] = true
-            end
-            app.xpcallw(function()
-                -- getWeaponConfig 走 require 拿模块缓存原表,ShootRate 是真实值(不受 ShootType 副本影响)
-                local w = app.getCurrentWeapon and app.getCurrentWeapon()
-                local cfg = w and app.getWeaponConfig and app.getWeaponConfig(w)
-                local sr = cfg and tonumber(cfg.ShootRate)
-                if sr and sr > 0 then
-                    app.rapidExpectedInterval = 60 / sr
-                end
-            end, "RapidFire")
-            app.xpcallw(app.applyRapidFireMode, "RapidFire")
+        if app.CONFIG_EFFECTS_READY and gui.Parent and rapidFireEnabled then
+            app.xpcallw(app.refreshRapidFire, "RapidFire")
         end
     end
 end)
@@ -14433,7 +14465,7 @@ task.spawn(app.hookDeathBeamClear, LocalPlayer.Character)
 -- 第三人称强制刷新
 task.spawn(function()
     while environmentLoaded do
-        if thirdPersonCamEnabled then
+        if app.CONFIG_EFFECTS_READY and thirdPersonCamEnabled then
             if LocalPlayer.CameraMode ~= Enum.CameraMode.Classic or LocalPlayer.CameraMinZoomDistance ~= 0.5 or LocalPlayer.CameraMaxZoomDistance < 999 then
                 LocalPlayer.CameraMode = Enum.CameraMode.Classic
                 LocalPlayer.CameraMinZoomDistance = 0.5
@@ -15562,6 +15594,9 @@ end
 
 -- 所有弹道依赖已就绪后再启用配置中保存的开关。
 app.startBulletPipeline()
+app.activateConfiguredToggles()
+app.CONFIG_LOADING = false
+app.scheduleCheatGPTSave()
 task.defer(function() app.xpcallw(app.ensureClientId, "ClientId") end)
 
 startup.runtime.phase = "ready"
