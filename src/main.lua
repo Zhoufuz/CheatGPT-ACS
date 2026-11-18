@@ -5519,7 +5519,7 @@ local rageBody = app.createSection(rageFrame, "Combat")
 
 local rageToggleControl = app.gateExecutorToggle(createModernToggle(rageBody, "RageBot", rageEnabled, function(v)
     rageEnabled = v
-end, "RageBot"), "getsenv", "debug.getupvalues", "newcclosure")
+end, "RageBot"), "getsenv", "debug.getupvalues")
 
 local onlyEnemyToggleControl = createModernToggle(rageBody, "Only Enemy", onlyEnemyEnabled, function(v)
     onlyEnemyEnabled = v
@@ -5539,7 +5539,10 @@ createSlider(rageBody, "Multi Target", 1, 8, app.RAGE_MULTI_TARGET, 0, function(
     app.RAGE_MULTI_TARGET = v
 end)
 
--- 旧 Thread 配置仍可读取；原生开火只保留一个 Begin/End，不显示无效的伤害并发控件。
+-- 对单个目标同时并发发送攻击的线程数(无论如何不能小于 1,这里 clamp 一次,使用处再兜底)
+createSlider(rageBody, "Thread", 1, 9, app.RAGE_THREADS_PER_TARGET, 0, function(v)
+    app.RAGE_THREADS_PER_TARGET = math.max(1, math.floor(v + 0.5))
+end)
 
 local targetPriorityDropdownControl = app.createDropdown(rageBody, "Target Priority", {"Distance", "Centre"}, app.TARGET_PRIORITY, function(v)
     app.TARGET_PRIORITY = v
@@ -10279,10 +10282,7 @@ do
             local record = enqueueBullet(part)
             if record then
                 app.captureFrameworkShot(record, ballistic, ...)
-                if app.nativeRageShotThreads and app.nativeRageShotThreads[coroutine.running()] then
-                    record.cancelAcceleration = true -- 保留原版 CastRay/HitEffect/Damage 全流程。
-                end
-                if muzzleBoostEnabled and not record.cancelAcceleration then
+                if muzzleBoostEnabled then
                     -- 让执行器自己的 Heartbeat 消费队列先处理；原版飞行循环尚未开始。
                     -- 超时/关开关/队列异常均放行原版，绝不永久阻塞开枪。
                     local deadline = os.clock() + 0.25
@@ -12985,7 +12985,6 @@ do
             "Last damage block: " .. tostring(damage.LastBlock or "None") .. " @ " .. tostring(damage.BlockedAt or 0),
             "Damage samples native/RageBot: " .. #(samples.Native or {}) .. "/" .. #(samples.RageBot or {}),
             app.buildDamageCaptureStatus and app.buildDamageCaptureStatus() or "Damage capture: not ready",
-            "Rage firing path: native Begin/End -> CreateBullet -> CastRay -> Damage",
             "Rage enabled/targets/pending: " .. tostring(rageEnabled) .. "/" .. #(app.rageTargets or {})
                 .. "/" .. tostring(app.ragePending or 0),
             "ACS environment/mods/session ready: " .. tostring(env ~= nil) .. "/"
@@ -13377,7 +13376,6 @@ end
 app.frameworkScripts = setmetatable({}, {__mode = "k"})
 app.damageStatus = {Sent = 0, Rejected = 0, Errors = 0, NilReplies = 0}
 app.damageSendThreads = setmetatable({}, {__mode = "k"})
-app.nativeRageShotThreads = setmetatable({}, {__mode = "k"})
 -- 缓存非敏感后缀，namecall 内只比较 Lua 值，不读取 Instance 属性。
 app.damageUserSuffix = "-" .. tostring(LocalPlayer.UserId)
 function app.startDamageCapture()
@@ -14565,18 +14563,6 @@ function app.buildDamageArgs(weapon, humanoid, distance, zone, config, hitPart, 
     return app.bindDamageContext(args, weapon, config, framework)
 end
 
-function app.forwardNativeRageDamage(forward, ...)
-    app.damageStatus.Sent += 1
-    local results = table.pack(pcall(forward, ...))
-    if not results[1] then
-        app.damageStatus.Errors += 1
-        error(results[2], 0)
-    end
-    if results[2] == false then app.damageStatus.Rejected += 1
-    elseif results[2] == nil then app.damageStatus.NilReplies += 1 end
-    return table.unpack(results, 2, results.n)
-end
-
 function app.sendDamage(args, sourceKind)
     if not args or not Damage then return false end
     local function current()
@@ -15273,7 +15259,7 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 
--- ========== RageBot 目标扫描（射击由原生驱动负责） ==========
+-- ========== RageBot 多线程主循环 ==========
 -- 架构：扫描（筛选→排序→命中精修→写共享表，三个事件入口每帧去重），射击（fireVolley 由三事件循环驱动、每事件连发 RAGE_FIRE_BURST 轮，每个目标再开 RAGE_THREADS_PER_TARGET 个并发子线程打 InvokeServer，在途请求超 RAGE_MAX_PENDING 自动暂停）
 -- 共享状态（扫描线程写、射击线程读）
 app.rageTargets = {}          -- 有序目标表 {player, targetPart, humanoid, hitPart, hitPos, hitZone, distance}
@@ -15491,177 +15477,90 @@ if environmentLoaded then
     RunService.PreAnimation:Connect(scanTargets)
     RunService.Heartbeat:Connect(scanTargets)
 
-end
+    -- ===== 射击（独立函数；扫描的排序/raycast 开销不再拖慢射速）=====
+    local function fireVolley()
+        if not rageEnabled or not app.rageWeaponRef or #app.rageTargets == 0 then return end
+        if not env or not char or not modTable or not accessId then return end
+        if app.ragePending >= math.max(1, app.RAGE_MAX_PENDING) then return end -- 在途请求堆积过多,暂停本轮等回落
 
--- 所有 ACS 共用原生开火驱动：只选择目标/按下/松开，不组装或重发 Damage。
-app.nativeRage = {Index = 1, AimFrames = 0, Focused = true}
-function app.releaseNativeRageJob(job)
-    if not job or not job.Started or job.Released or job.Releasing then return end
-    job.Releasing = true
-    job.Released = app.xpcallw(job.Driver.endFire, "Rage原生停止")
-    job.Releasing = false
-end
+        local origin = app.rageFireOrigin
+        local weapon = app.rageWeaponRef
+        local weaponConfig = app.rageWeaponConfigRef
+        if not app.isDamagePayloadReady(weapon, weaponConfig, env) then return end
+        local shotOrigin = Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.Position or origin
+        if app.isBallisticFramework(env) then shotOrigin = app.getNativeShotOrigin(char, Workspace.CurrentCamera, origin) end
+        local maxTargets = math.min(app.RAGE_MULTI_TARGET, #app.rageTargets)
+        local threadCount = math.max(1, app.RAGE_THREADS_PER_TARGET) -- 无论如何不能小于 1
 
-function app.stopNativeRage()
-    local state = app.nativeRage
-    state.Active, state.Target, state.AimFrames = false, nil, 0
-    if state.Job then
-        state.Job.Cancelled = true
-        app.releaseNativeRageJob(state.Job)
-    end
-    local bridge = state.Bridge
-    if bridge then
-        if bridge.Framework.CreateBullet == bridge.Wrapper then
-            app.ensureTableWritable(bridge.Framework)
-            bridge.Framework.CreateBullet = bridge.Original
-        end
-        state.Bridge = nil
-    end
-end
+        for i = 1, maxTargets do
+            local t = app.rageTargets[i]
+            -- 每个目标并发 threadCount 个攻击线程同时发送 Damage;
+            -- 反馈(beam/音效/hitmarker)只由首个成功的线程播放一次,HitLog 伤害监听每目标只挂一次(全部线程失败才撤销)
+            local feedbackDone = false
+            local failCount = 0
+            local hitPartName = (t.hitPart and t.hitPart.Name) or "Unknown"
+            local cancelDamageWatch = createDamageWatch(t.player, hitPartName, t.distance, t.hitZone == 1)
 
-function app.bindNativeRageBullet(framework)
-    local state = app.nativeRage
-    local bridge = state.Bridge
-    if bridge and bridge.Framework == framework and framework.CreateBullet == bridge.Wrapper then return true end
-    if bridge then
-        if bridge.Framework.CreateBullet == bridge.Wrapper then
-            app.ensureTableWritable(bridge.Framework)
-            bridge.Framework.CreateBullet = bridge.Original
-        end
-        state.Bridge = nil
-    end
-    local original = framework.CreateBullet
-    if type(original) ~= "function" then return false end
-    local wrapper = app.makeHookCClosure(original, function(...)
-        local job = state.Job
-        if not job or job.Framework ~= framework or not job.Started or job.Released then return original(...) end
-        -- Spawn(CreateBullet) 运行在新的协程中，在子弹自身协程保持来源直到 CastRay 返回。
-        job.ShotSeen, job.ShotAt = true, os.clock()
-        local thread = coroutine.running()
-        local previous = app.nativeRageShotThreads[thread]
-        app.nativeRageShotThreads[thread] = job
-        local results = table.pack(pcall(original, ...))
-        app.nativeRageShotThreads[thread] = previous
-        if not results[1] then error(results[2], 0) end
-        return table.unpack(results, 2, results.n)
-    end)
-    if not wrapper then return false end
-    app.ensureTableWritable(framework)
-    framework.CreateBullet = wrapper
-    state.Bridge = {Framework = framework, Original = original, Wrapper = wrapper}
-    return true
-end
+            for _ = 1, threadCount do
+                -- 每个线程一个并发子线程：多个 InvokeServer 互不等待，真正并行开火
+                task.spawn(function()
+                    app.ragePending += 1
+                    local success = false
+                    -- 发射前再校验一次：目标可能在扫描后的瞬间死亡/离场
+                    if t.player and t.player.Character and app.isAlive(t.player) and Damage then
+                        local direction = t.hitPos - origin
+                        if direction.Magnitude > 0 then
+                            local hitPos = app.correctRageHit(env, t.hitPart, t.hitPos, direction.Unit)
+                            if hitPos then
+                                local args = app.buildDamageArgs(weapon, t.humanoid, t.distance, t.hitZone, weaponConfig,
+                                    t.hitPart, hitPos, shotOrigin, direction.Unit)
+                                success = app.sendDamage(args, "RageBot")
+                            end
+                        end
+                    end
+                    app.ragePending -= 1
 
-function app.stepNativeRageAim()
-    local state = app.nativeRage
-    local target, camera = state.Target, Workspace.CurrentCamera
-    if not state.Active or not target or not camera or not target.hitPart or not target.hitPart.Parent then return end
-    local point = target.hitPart.Position
-    local position = camera.CFrame.Position
-    if (point - position).Magnitude <= 0.001 then return end
-    -- 让原版镜头/枪口/Atirar 和真实弹道使用同一瞄准方向，不伪造命中位置。
-    camera.CFrame = CFrame.lookAt(position, point, camera.CFrame.UpVector)
-    state.AimFrames += 1
-end
-
-function app.stepNativeRage(now)
-    local state = app.nativeRage
-    local job = state.Job
-    local weapon = app.rageWeaponRef
-    local targets = app.rageTargets or {}
-    local valid = not state.Dead and state.Focused and rageEnabled and env ~= nil
-        and weapon ~= nil and #targets > 0 and app.CONFIG_EFFECTS_READY
-        and app.isDamagePayloadReady(weapon, app.rageWeaponConfigRef, env)
-    if not valid then app.stopNativeRage() end
-    if job and not app.isFrameworkForCharacter(job.Framework, LocalPlayer.Character) then
-        job.Cancelled = true
-        app.releaseNativeRageJob(job)
-        state.Job, job = nil, nil -- 已移除的旧角色不能阻塞新角色；旧 Begin 返回仍自行 End。
-    end
-    if job then
-        if not valid or job.Framework ~= env or job.Weapon ~= weapon or job.ShotSeen or now >= job.Deadline
-            or not job.Target.hitPart.Parent or not app.isAlive(job.Target.player)
-            or (job.Done and not job.ShotSeen and now - job.StartedAt >= 0.05) then
-            job.Cancelled = true
-            app.releaseNativeRageJob(job)
-        end
-        if job.Done and (job.Released or not job.Started) then
-            if job.CancelWatch and not job.ShotSeen then job.CancelWatch() end
-            state.Job = nil
-            state.Index = job.ShotSeen and (state.Index + 1) or state.Index
-            if job.ShotAt then state.NextAttempt = math.max(state.NextAttempt or 0, job.ShotAt + job.Period) end
-        else
-            return -- 原生 Begin 即使 yield 也必须完成并配对 End，才允许下一次 Begin。
+                    if success and not feedbackDone then
+                        feedbackDone = true -- 首个成功线程播反馈,后续线程不再播
+                        app.createForwardBeam(origin, t.targetPart)
+                        app.playHitsound()
+                        app.showHitmarker(t.hitZone == 1, t.hitPos, t.hitPart)
+                    elseif not success then
+                        failCount += 1
+                        if failCount >= threadCount then
+                            cancelDamageWatch() -- 全部线程都失败才撤销监听,否则留给 HealthChanged 判定
+                        end
+                    end
+                end)
+            end
         end
     end
-    if not valid then return end
-    local count = math.min(#targets, math.max(1, app.RAGE_MULTI_TARGET))
-    if state.Index > count then state.Index = 1 end
-    local target = targets[state.Index]
-    if not target or not target.hitPart or not target.hitPart.Parent or not app.isAlive(target.player) then
-        app.stopNativeRage(); return
+    -- 每个帧事件触发时连续开火 RAGE_FIRE_BURST 轮(至少 1 轮)
+    local function fireDriver()
+        local burst = math.max(1, math.floor(app.RAGE_FIRE_BURST + 0.5))
+        for _ = 1, burst do
+            fireVolley()
+        end
     end
-    local driver = app.resolveTriggerDriver and app.resolveTriggerDriver(env)
-    if not driver or not app.bindNativeRageBullet(env) then
-        app.stopNativeRage()
-        app.blockDamage("Native Fire Begin/End or CreateBullet entry unavailable")
-        return
-    end
-    if not state.Target or state.Target.hitPart ~= target.hitPart or state.Weapon ~= weapon then state.AimFrames = 0 end
-    state.Active, state.Target, state.Weapon = true, target, weapon
-    if state.AimFrames < 2 or now < (state.NextAttempt or 0) then return end
-    if app.resetTrigger then app.resetTrigger(false) end
-    local rate = tonumber(app.rageWeaponConfigRef.ShootRate) or 600
-    if rate <= 0 or rate ~= rate or rate == math.huge then rate = 600 end
-    local period = math.max(1 / 60, 60 / (rapidFireEnabled and app.RAPID_FIRE_RATE or rate))
-    state.NextAttempt = now + period
-    job = {Framework = env, Weapon = weapon, Target = target, Driver = driver,
-        StartedAt = now, Deadline = now + 0.25, Period = period}
-    state.Job = job
+    -- Stepped(物理步前) + PreAnimation(动画更新前) + Heartbeat(渲染后) 三个循环各自独立驱动,
+    -- 总请求速率 ≈ 帧率 × 3 事件 × RAGE_FIRE_BURST × Thread,成倍放大
     task.spawn(function()
-        if job.Cancelled or state.Dead or not rageEnabled or state.Job ~= job
-            or env ~= job.Framework or app.getCurrentWeapon() ~= job.Weapon then
-            job.Done = true; return
-        end
-        local watchOk, cancelWatch = app.xpcallw(createDamageWatch, "Rage原生命中监听",
-            target.player, target.hitPart.Name, target.distance, target.hitZone == 1)
-        if watchOk then job.CancelWatch = cancelWatch end
-        job.Started = true
-        -- 先安排超时释放，beginFire 自身 yield 也不会使全自动永久按住。
-        task.delay(0.25, function()
-            if job.Done and job.Released then return end
-            job.Cancelled = true
-            app.releaseNativeRageJob(job)
-        end)
-        local ok = app.xpcallw(driver.beginFire, "Rage原生开火")
-        job.Done = true
-        if job.Cancelled or job.Released or not ok then
-            job.Cancelled, job.Released = true, false
-            app.releaseNativeRageJob(job) -- 延迟 Begin 返回后可能重置开火标志，再补发 End。
+        while true do
+            RunService.Stepped:Wait()
+            fireDriver()
         end
     end)
-end
-
-do
-    local aimBinding = "CGTNativeRage" .. tostring(LocalPlayer.UserId)
-    RunService:BindToRenderStep(aimBinding, Enum.RenderPriority.Camera.Value + 1, function()
-        local ok = app.xpcallw(app.stepNativeRageAim, "Rage原生瞄准")
-        if not ok then app.stopNativeRage() end
+    task.spawn(function()
+        while true do
+            RunService.PreAnimation:Wait()
+            fireDriver()
+        end
     end)
-    local heartbeat = RunService.Heartbeat:Connect(function()
-        local ok = app.xpcallw(app.stepNativeRage, "Rage原生驱动", os.clock())
-        if not ok then app.stopNativeRage() end
-    end)
-    local removing = LocalPlayer.CharacterRemoving:Connect(app.stopNativeRage)
-    local focusLost = UserInputService.WindowFocusReleased:Connect(function()
-        app.nativeRage.Focused = false; app.stopNativeRage()
-    end)
-    local focusGained = UserInputService.WindowFocused:Connect(function() app.nativeRage.Focused = true end)
-    gui.Destroying:Connect(function()
-        app.nativeRage.Dead = true
-        app.stopNativeRage()
-        RunService:UnbindFromRenderStep(aimBinding)
-        heartbeat:Disconnect(); removing:Disconnect(); focusLost:Disconnect(); focusGained:Disconnect()
+    task.spawn(function()
+        while true do
+            RunService.Heartbeat:Wait()
+            fireDriver()
+        end
     end)
 end
 
@@ -15738,10 +15637,9 @@ do
                     end
                 end
                 local callerOk, callingScript = pcall(getcallingscript)
-                local rageShot = self == Damage and app.nativeRageShotThreads[coroutine.running()]
                 if self == Damage and app.damageCapture
                     and not app.damageSendThreads[coroutine.running()] then
-                    local source = rageShot and "RageBot" or app.classifyDamageCaller(callerOk, callingScript)
+                    local source = app.classifyDamageCaller(callerOk, callingScript)
                     -- 复用已有监听；不读取 Instance 属性，不改参数或返回值，不安装额外 hook。
                     app.tryCaptureDamagePacket(source, table.pack(select(2, ...)))
                 end
@@ -15749,7 +15647,7 @@ do
                     and os.clock() <= app.triggerFeedbackUntil and app.triggerFeedbackTarget ~= nil
                 -- 手动 ACS 调用优先使用 calling script；Trigger 的原生手机/电脑入口可能异步发送
                 -- Damage，此时 calling script 为空，只在本轮 Trigger 的短时间窗口内放行。
-                if Damage and self == Damage and ((callerOk and callingScript ~= nil) or triggerWindow or rageShot) then
+                if Damage and self == Damage and ((callerOk and callingScript ~= nil) or triggerWindow) then
                     -- 参数布局:(Damage=self, tool, humanoid, distance, hitZone, ...)
                     -- 之前错一位把 tool 当 humanoid、distance 当 hitZone,导致爆头永不红(humanoid.Parent 恰好也是角色才没报错)
                     local _, tool, humanoid, _, hitZone = ...
@@ -15766,11 +15664,6 @@ do
                         end
                     end
                 end
-            end
-            -- 原生 Rage 的返回值只用于诊断，保持原始 nil/false/多返回值及异常。
-            if app.nativeRageShotThreads[coroutine.running()] and select(1, ...) == Damage
-                and ok and (method == "InvokeServer" or method == "FireServer") then
-                return app.forwardNativeRageDamage(oldNamecall, ...)
             end
             -- 全部原样转发,namecall 方法名由 VM 寄存器保留,行为与原生一致
             return oldNamecall(...)
@@ -16186,7 +16079,7 @@ end
                 circle.Size = UDim2.fromOffset(app.AIM_FOV_SIZE * 2, app.AIM_FOV_SIZE * 2)
                 stroke.Color, stroke.Transparency = app.AIM_FOV_COLOR, app.AIM_FOV_TRANSPARENCY
             end
-            if not (app.nativeRage and app.nativeRage.Active) then app.stepAimAssist(camera, dt) end
+            app.stepAimAssist(camera, dt)
         end, "Aim Assist")
         if not ok then app.resetAimAssist() end
     end)
@@ -16258,7 +16151,6 @@ do
 
     function app.stepTrigger(now, target, weapon, driver, config)
         serviceJob()
-        if app.nativeRage and app.nativeRage.Active then app.resetTrigger(false); return end
         if not app.TRIGGER_ENABLED or not target or not weapon or not driver or not config or config.Type ~= "Gun"
             or (app.TRIGGER_ONLY_SCOPE and not app.isLegitScoped())
             or app.getTriggerTarget(Workspace.CurrentCamera) ~= target then
