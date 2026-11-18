@@ -12960,6 +12960,7 @@ do
             if ok then executor = tostring(name) .. " " .. tostring(version or "") end
         end
         local status = app.steadyAimStatus or {}
+        local damage = app.damageStatus or {}
         local ready, waiting, busy = 0, 0, 0
         local failures = {}
         for _, item in pairs(app.imageBindings) do
@@ -12980,6 +12981,9 @@ do
             "Totals: " .. app.lifetimeStats.Kills .. " kills / " .. app.lifetimeStats.Score .. " score",
             "Storage: CheatGPT/ACS/misc.json",
             "Missing APIs: " .. table.concat(app.EXEC_UNSUPPORTED or {}, ", "),
+            "Damage sent/rejected/errors/nil replies: " .. tostring(damage.Sent or 0) .. "/"
+                .. tostring(damage.Rejected or 0) .. "/" .. tostring(damage.Errors or 0) .. "/" .. tostring(damage.NilReplies or 0),
+            "Last damage block: " .. tostring(damage.LastBlock or "None") .. " @ " .. tostring(damage.BlockedAt or 0),
         }
         for _, name in ipairs({"getconnections/getgc", "debug.getconstants", "debug.getupvalue", "debug.setupvalue", "hookfunction", "newcclosure"}) do
             if not app.EXEC_SUPPORT[name] then lines[#lines + 1] = "Steady Aim missing: " .. name end
@@ -13357,11 +13361,27 @@ do
 end
 
 -- ========== ACS 环境初始化 ==========
+app.frameworkScripts = setmetatable({}, {__mode = "k"})
+app.damageStatus = {Sent = 0, Rejected = 0, Errors = 0, NilReplies = 0}
+function app.blockDamage(reason)
+    app.damageStatus.LastBlock, app.damageStatus.BlockedAt = reason, os.clock()
+    return false
+end
+function app.isFrameworkForCharacter(framework, character)
+    if type(framework) ~= "table" or not character or not character.Parent then return false end
+    local client = character:FindFirstChild("ACS_Client")
+    -- getsenv 返回的代理表不一定把 script 存成自身字段；以取得环境时的脚本实例为准。
+    local scriptObject = app.frameworkScripts[framework] or rawget(framework, "script")
+    return client ~= nil and typeof(scriptObject) == "Instance"
+        and (scriptObject == client or scriptObject:IsDescendantOf(client))
+end
+
 function app.tryGetEnv(scriptObj)
     if not app.EXEC_SUPPORT["getsenv"] then return nil end -- 执行器缺 getsenv:直接失败,避免 xpcallw 报错刷 Toast
     if not scriptObj or not scriptObj:IsA("LocalScript") then return nil end
     local success, envTemp = app.xpcallw(getsenv, "tryGetEnv", scriptObj)
     if success and envTemp and type(envTemp.setMods) == "function" then
+        app.frameworkScripts[envTemp] = scriptObj
         return envTemp
     end
     return nil
@@ -13394,6 +13414,7 @@ function app.collectFrameworkEnvs()
     for _, s in ipairs(app.collectACSScripts()) do
         local ok, e = app.xpcallw(getsenv, "collectFrameworkEnvs", s)
         if ok and e and type(e.setMods) == "function" then
+            app.frameworkScripts[e] = s
             table.insert(envs, e)
         end
     end
@@ -14168,13 +14189,37 @@ function app.getAccessId(env)
     return nil
 end
 
-function app.initEnvironment()
-    local e = app.findMainScript()
-    if not e then return false end
-    env = e
-    modTable = app.findModTable(env)
-    accessId = app.getAccessId(env)
-    return modTable ~= nil and accessId ~= nil
+function app.initEnvironment(candidate)
+    local character = LocalPlayer.Character
+    local e = candidate or app.findMainScript()
+    if not app.isFrameworkForCharacter(e, character) then return false end
+    local mods = app.findModTable(e)
+    if not mods then return false end
+    local id = app.getAccessId(e) -- 可能 yield，不能提前发布半初始化的新环境。
+    if not id or LocalPlayer.Character ~= character or not app.isFrameworkForCharacter(e, character) then return false end
+    env, modTable, accessId = e, mods, id
+    return true
+end
+
+function app.clearDamageEnvironment()
+    env, modTable, accessId = nil, nil, nil
+    app.rageWeaponRef, app.rageWeaponConfigRef = nil, nil
+    if app.rageTargets then table.clear(app.rageTargets) end
+    app.blockDamage("Waiting for current ACS environment")
+end
+
+function app.refreshDamageEnvironment()
+    if app.damageEnvironmentRefreshing then return end
+    app.damageEnvironmentRefreshing = true
+    app.xpcallw(function()
+        if not app.isFrameworkForCharacter(env, LocalPlayer.Character) then app.clearDamageEnvironment() end
+        local current = app.findMainScript()
+        if current and (current ~= env or not modTable or not accessId) then
+            app.clearDamageEnvironment()
+            app.initEnvironment(current)
+        end
+    end, "ACS环境刷新")
+    app.damageEnvironmentRefreshing = false
 end
 
 startup.stage = "读取 ACS 模组与 AccessId"
@@ -14192,6 +14237,21 @@ if not firstSuccessShown then
     firstSuccessShown = true
 end
 startup.stage = "连接功能与事件"
+
+-- RageBot 自己维持环境，不能依赖 Bullet Trace/子弹加速替它处理重生。
+LocalPlayer.CharacterRemoving:Connect(function(character)
+    if app.isFrameworkForCharacter(env, character) then app.clearDamageEnvironment() end
+end)
+LocalPlayer.CharacterAdded:Connect(function()
+    app.clearDamageEnvironment()
+    task.defer(app.refreshDamageEnvironment)
+end)
+task.spawn(function()
+    while gui.Parent do
+        task.wait(0.25)
+        if gui.Parent then app.refreshDamageEnvironment() end
+    end
+end)
 
 local Events = ReplicatedStorage:FindFirstChild("ACS_Engine") and ReplicatedStorage.ACS_Engine:FindFirstChild("Events")
 local Damage = Events and Events:FindFirstChild("Damage")
@@ -14214,19 +14274,18 @@ function app.isDamageWeaponCurrent(weapon, framework)
     if not character or not character.Parent or typeof(weapon) ~= "Instance"
         or not weapon:IsA("Tool") or weapon.Parent ~= character or type(framework) ~= "table" then return false end
     local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local client = character:FindFirstChild("ACS_Client")
-    local scriptObject = rawget(framework, "script")
-    return humanoid ~= nil and humanoid.Health > 0 and client ~= nil
-        and typeof(scriptObject) == "Instance" and (scriptObject == client or scriptObject:IsDescendantOf(client))
+    return humanoid ~= nil and humanoid.Health > 0 and app.isFrameworkForCharacter(framework, character)
 end
 
 app.damageSettingsPools = setmetatable({}, {__mode = "k"})
 function app.isDamagePayloadReady(weapon, config, framework)
-    if type(config) ~= "table" or not app.isDamageWeaponCurrent(weapon, framework) then return false end
+    if type(config) ~= "table" or not app.isDamageWeaponCurrent(weapon, framework) then
+        return app.blockDamage("Weapon, character or framework is not current")
+    end
     if not app.isBallisticFramework(framework) then return true end
     -- 自动读取 HitStats 实际捕获的配置，不使用固定上值编号，也不调用未就绪的函数。
     local values = app.readLuaUpvalues(framework.HitStats)
-    if not values then return false end
+    if not values then return app.blockDamage("Cannot inspect native HitStats") end
     for _, value in pairs(values) do
         if value == config or (app.rapidForgeReal[framework] == config
             and value == app.rapidForgeCopy[framework]) then return true end
@@ -14245,7 +14304,7 @@ function app.isDamagePayloadReady(weapon, config, framework)
             end
         end
     end
-    return false
+    return app.blockDamage("Native weapon settings are not ready or do not match this Tool")
 end
 
 function app.bindDamageContext(args, weapon, config, framework)
@@ -14295,15 +14354,21 @@ function app.sendDamage(args)
         return args.sourceCharacter == LocalPlayer.Character and args.sourceFramework == env
             and app.isDamagePayloadReady(args[1], args.sourceConfig, args.sourceFramework)
     end
-    if not current() then return false end
+    if not current() then return app.blockDamage("Queued damage context expired") end
     -- Presentation metadata only; damage arguments and acceptance remain unchanged.
     if app.killEffect then pcall(app.killEffect.ObserveHit, args[2], args[1], args[4]) end
+    local dispatched = false
     local ok, result = app.xpcallw(function()
-        if not current() then return false end
+        if not current() then return app.blockDamage("Damage context changed before sending") end
+        dispatched = true
+        app.damageStatus.Sent += 1
         if isDamageFunction then return Damage:InvokeServer(table.unpack(args, 1, args.n)) end
         Damage:FireServer(table.unpack(args, 1, args.n))
         return true
     end, "Damage")
+    if not ok then app.damageStatus.Errors += 1
+    elseif dispatched and result == false then app.damageStatus.Rejected += 1
+    elseif dispatched and result == nil then app.damageStatus.NilReplies += 1 end
     -- 变体 4 原版明确要求 true；网络调用没报错不等于服务器接受命中。
     return ok and result ~= false and (args.n ~= 14 or result == true)
 end
