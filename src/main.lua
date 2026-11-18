@@ -13469,6 +13469,8 @@ function app.createAmmoSetupGuard()
                         return table.unpack(result, 1, result.n)
                     end
                     app.ensureTableWritable(e)
+                    app.HOOK_LUA_SOURCES[current.Setup] = current.OriginalSetup
+                    app.HOOK_LUA_SOURCES[current.Attachment] = current.OriginalAttachment
                     e.setup, e.loadAttachment = current.Setup, current.Attachment
                     records[e] = current
                 end
@@ -14206,18 +14208,67 @@ function app.getDamageArgumentCount()
     return 9
 end
 
+-- 工具仍在角色内不代表 ACS 已完成 setup；卸载也会先清空配置再移动工具。
+function app.isDamageWeaponCurrent(weapon, framework)
+    local character = LocalPlayer.Character
+    if not character or not character.Parent or typeof(weapon) ~= "Instance"
+        or not weapon:IsA("Tool") or weapon.Parent ~= character or type(framework) ~= "table" then return false end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local client = character:FindFirstChild("ACS_Client")
+    local scriptObject = rawget(framework, "script")
+    return humanoid ~= nil and humanoid.Health > 0 and client ~= nil
+        and typeof(scriptObject) == "Instance" and (scriptObject == client or scriptObject:IsDescendantOf(client))
+end
+
+app.damageSettingsPools = setmetatable({}, {__mode = "k"})
+function app.isDamagePayloadReady(weapon, config, framework)
+    if type(config) ~= "table" or not app.isDamageWeaponCurrent(weapon, framework) then return false end
+    if not app.isBallisticFramework(framework) then return true end
+    -- 自动读取 HitStats 实际捕获的配置，不使用固定上值编号，也不调用未就绪的函数。
+    local values = app.readLuaUpvalues(framework.HitStats)
+    if not values then return false end
+    for _, value in pairs(values) do
+        if value == config or (app.rapidForgeReal[framework] == config
+            and value == app.rapidForgeCopy[framework]) then return true end
+        if type(value) == "table" and type(rawget(value, "gunName")) == "string"
+            and type(rawget(value, "ShootRate")) == "number" then
+            local nativeConfig = value == app.rapidForgeCopy[framework] and app.rapidForgeReal[framework] or value
+            -- 部分 ACS 在 setup 中按 Tool 缓存深拷贝配置；验证它确实属于这把工具。
+            local cached = app.damageSettingsPools[framework]
+            if cached and cached.Setup == framework.setup and rawget(cached.Pool, weapon) == nativeConfig then return true end
+            local setupValues = app.readLuaUpvalues(framework.setup)
+            for _, pool in pairs(setupValues or {}) do
+                if type(pool) == "table" and rawget(pool, weapon) == nativeConfig then
+                    app.damageSettingsPools[framework] = {Setup = framework.setup, Pool = pool}
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+function app.bindDamageContext(args, weapon, config, framework)
+    if framework ~= env or not app.isDamagePayloadReady(weapon, config, framework) then return nil end
+    -- 仅本地校验用；发送始终 unpack 1..n，这些字段不进入远端参数。
+    args.sourceCharacter, args.sourceFramework, args.sourceConfig = LocalPlayer.Character, framework, config
+    return args
+end
+
 function app.buildDamageArgs(weapon, humanoid, distance, zone, config, hitPart, hitPos, shotOrigin, shotDirection)
-    if not hitPart or not hitPart.Parent or not modTable or not accessId then return nil end
+    local framework = env
+    if not hitPart or not hitPart.Parent or not modTable or not accessId
+        or not app.isDamagePayloadReady(weapon, config, framework) then return nil end
     local count = app.getDamageArgumentCount()
     if app.isBallisticFramework(env) then
         if typeof(hitPos) ~= "Vector3" then return nil end
         if typeof(shotOrigin) == "Vector3" then distance = (hitPos - shotOrigin).Magnitude end
         local ok, stats, mods, region = app.xpcallw(function()
-            return env.HitStats(), env.HitMods(), env.Ballistics.Zone(hitPart)
+            return framework.HitStats(), framework.HitMods(), framework.Ballistics.Zone(hitPart)
         end, "Ballistics命中载荷")
         if not ok or type(stats) ~= "table" or type(mods) ~= "table" or not region then return nil end
-        return table.pack(weapon, humanoid, distance, region, stats, mods,
-            nil, nil, accessId .. "-" .. LocalPlayer.UserId, hitPos)
+        return app.bindDamageContext(table.pack(weapon, humanoid, distance, region, stats, mods,
+            nil, nil, accessId .. "-" .. LocalPlayer.UserId, hitPos), weapon, config, framework)
     end
     if count == 14 then
         local ok, region = app.xpcallw(env.hitRegion, "Damage区域", hitPart)
@@ -14235,14 +14286,20 @@ function app.buildDamageArgs(weapon, humanoid, distance, zone, config, hitPart, 
         args[14] = hitPos
     end
     args.n = count -- nil 占位必须保留，不能依赖含空洞数组的 # / 默认 unpack 上界。
-    return args
+    return app.bindDamageContext(args, weapon, config, framework)
 end
 
 function app.sendDamage(args)
     if not args or not Damage then return false end
+    local function current()
+        return args.sourceCharacter == LocalPlayer.Character and args.sourceFramework == env
+            and app.isDamagePayloadReady(args[1], args.sourceConfig, args.sourceFramework)
+    end
+    if not current() then return false end
     -- Presentation metadata only; damage arguments and acceptance remain unchanged.
     if app.killEffect then pcall(app.killEffect.ObserveHit, args[2], args[1], args[4]) end
     local ok, result = app.xpcallw(function()
+        if not current() then return false end
         if isDamageFunction then return Damage:InvokeServer(table.unpack(args, 1, args.n)) end
         Damage:FireServer(table.unpack(args, 1, args.n))
         return true
@@ -14253,7 +14310,7 @@ end
 
 -- 获取当前武器工具
 function app.getCurrentWeapon()
-    if not char then char = LocalPlayer.Character end
+    char = LocalPlayer.Character
     if not char then return nil end
     for _, tool in ipairs(char:GetChildren()) do
         if tool:IsA("Tool") and tool:FindFirstChild("ACS_Settings") then
@@ -14995,7 +15052,7 @@ if environmentLoaded then
             cachedRageSettings = weaponSettings
             cachedRageWeaponConfig = weaponConfig
         end
-        if not weaponConfig then return end
+        if not app.isDamagePayloadReady(weapon, weaponConfig, env) then return end
 
         -- 武器发射点只算一次，射击线程共用
         local origin
@@ -15144,6 +15201,7 @@ if environmentLoaded then
         local origin = app.rageFireOrigin
         local weapon = app.rageWeaponRef
         local weaponConfig = app.rageWeaponConfigRef
+        if not app.isDamagePayloadReady(weapon, weaponConfig, env) then return end
         local shotOrigin = Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.Position or origin
         local maxTargets = math.min(app.RAGE_MULTI_TARGET, #app.rageTargets)
         local threadCount = math.max(1, app.RAGE_THREADS_PER_TARGET) -- 无论如何不能小于 1
