@@ -12984,6 +12984,11 @@ do
                 .. tostring(damage.Rejected or 0) .. "/" .. tostring(damage.Errors or 0) .. "/" .. tostring(damage.NilReplies or 0),
             "Last damage block: " .. tostring(damage.LastBlock or "None") .. " @ " .. tostring(damage.BlockedAt or 0),
             "Damage samples native/RageBot: " .. #(samples.Native or {}) .. "/" .. #(samples.RageBot or {}),
+            app.buildDamageCaptureStatus and app.buildDamageCaptureStatus() or "Damage capture: not ready",
+            "Rage enabled/targets/pending: " .. tostring(rageEnabled) .. "/" .. #(app.rageTargets or {})
+                .. "/" .. tostring(app.ragePending or 0),
+            "ACS environment/mods/session ready: " .. tostring(env ~= nil) .. "/"
+                .. tostring(modTable ~= nil) .. "/" .. tostring(accessId ~= nil),
         }
         for _, name in ipairs({"getconnections/getgc", "debug.getconstants", "debug.getupvalue", "debug.setupvalue", "hookfunction", "newcclosure"}) do
             if not app.EXEC_SUPPORT[name] then lines[#lines + 1] = "Steady Aim missing: " .. name end
@@ -13017,10 +13022,10 @@ do
         app.showNotification("Debug", "Notification and icon loading test", 5, {iconKey = "bug"})
     end)
     action("Clear error log", 6, function() table.clear(app.debugErrors); refresh() end)
-    action("Capture Damage (30s)", 7, function()
-        app.damageCapture = {Until = os.clock() + 30, Samples = {}, LastAt = {}}
+    action("Capture Damage (120s)", 7, function()
+        app.startDamageCapture()
         app.showNotification("Debug", app.manualHookActive
-            and "30s capture: turn off RageBot and muzzle acceleration, land one manual hit, then enable RageBot with the same weapon. Copy diagnostics."
+            and "120s capture: turn off RageBot and muzzle acceleration, land one manual hit, then enable RageBot with the same weapon. Copy diagnostics."
             or "Native Damage capture unavailable: the existing namecall hook is inactive. Script-side sends can still be captured.", 10)
     end)
     task.spawn(function()
@@ -13371,6 +13376,45 @@ end
 app.frameworkScripts = setmetatable({}, {__mode = "k"})
 app.damageStatus = {Sent = 0, Rejected = 0, Errors = 0, NilReplies = 0}
 app.damageSendThreads = setmetatable({}, {__mode = "k"})
+-- 缓存非敏感后缀，namecall 内只比较 Lua 值，不读取 Instance 属性。
+app.damageUserSuffix = "-" .. tostring(LocalPlayer.UserId)
+function app.startDamageCapture()
+    local now = os.clock()
+    app.damageCapture = {
+        StartedAt = now, Until = now + 120, Samples = {}, LastAt = {},
+        Observed = {}, Expired = {}, Errors = 0, SentAtStart = app.damageStatus.Sent,
+    }
+end
+
+function app.buildDamageCaptureStatus()
+    local capture = app.damageCapture
+    if not capture then return "Damage capture: not started" end
+    local remaining = math.max(0, capture.Until - os.clock())
+    return "Damage capture: " .. (remaining > 0 and (math.ceil(remaining) .. "s remaining") or "expired")
+        .. " / started @ " .. tostring(capture.StartedAt or "unknown")
+        .. " / script sends since start: " .. tostring((app.damageStatus.Sent or 0) - (capture.SentAtStart or 0))
+        .. " / capture errors: " .. tostring(capture.Errors or 0)
+end
+
+function app.classifyDamageCaller(callerOk, callingScript)
+    if callerOk and callingScript ~= nil then
+        local nativeScript = env and (app.frameworkScripts[env] or rawget(env, "script"))
+        if callingScript == nativeScript then return "Native" end
+        -- 主环境切换期间，已确认的其他 ACS LocalScript 仍可发送合法原版命中。
+        for _, registered in pairs(app.frameworkScripts) do
+            if registered == callingScript then return "Native" end
+        end
+    end
+    return "Unclassified" -- Delta 无法给出来源时保留未知，不能伪装成已确认原版。
+end
+
+function app.tryCaptureDamagePacket(source, args)
+    local ok = pcall(app.captureDamagePacket, source, args)
+    if not ok and app.damageCapture then
+        app.damageCapture.Errors = (app.damageCapture.Errors or 0) + 1
+    end
+end
+
 function app.snapshotDamageValue(value, depth, budget)
     if type(value) ~= "table" then return value end
     if depth >= 6 or budget.Left <= 0 then budget.Truncated = true; return "<truncated>" end
@@ -13388,12 +13432,24 @@ end
 function app.captureDamagePacket(source, args)
     local capture = app.damageCapture
     local now = os.clock()
-    if not capture or now > capture.Until then return end
+    if not capture then return end
+    if now > capture.Until then
+        capture.Expired = capture.Expired or {}
+        capture.Expired[source] = (capture.Expired[source] or 0) + 1
+        return
+    end
+    capture.Observed = capture.Observed or {}
+    capture.Observed[source] = (capture.Observed[source] or 0) + 1
     local samples = capture.Samples[source] or {}
     if #samples >= 3 or now - (capture.LastAt[source] or -math.huge) < 0.25 then return end
     local budget, packet = {Left = 256}, {n = args.n, At = now}
     for i = 1, math.min(args.n, 16) do packet[i] = app.snapshotDamageValue(args[i], 0, budget) end
     packet.Truncated = budget.Truncated or args.n > 16
+    -- 采到手动包就能检查脚本持有的会话是否一致，无需等待第二种来源。
+    packet.ScriptSessionMatch = "unavailable"
+    if type(accessId) == "string" and type(app.damageUserSuffix) == "string" and type(args[9]) == "string" then
+        packet.ScriptSessionMatch = tostring(args[9] == accessId .. app.damageUserSuffix)
+    end
     samples[#samples + 1] = packet
     capture.Samples[source], capture.LastAt[source] = samples, now
 end
@@ -13422,13 +13478,16 @@ end
 function app.buildDamageCaptureReport()
     local capture = app.damageCapture
     if not capture then return "Damage capture: not started" end
-    local lines = {"Damage arguments at dispatch (up to 3 samples/source; instance paths resolved when copied):"}
+    local lines = {app.buildDamageCaptureStatus(), "Damage arguments at dispatch (up to 3 samples/source; instance paths resolved when copied):"}
     for _, source in ipairs({"Native", "RageBot", "Accelerated", "Script", "Unclassified"}) do
         local samples = capture.Samples[source] or {}
         lines[#lines + 1] = source .. " samples: " .. #samples
+            .. " / observed in window: " .. tostring((capture.Observed or {})[source] or 0)
+            .. " / after expiry: " .. tostring((capture.Expired or {})[source] or 0)
         for index, packet in ipairs(samples) do
             lines[#lines + 1] = source .. " #" .. index .. " @ " .. packet.At .. " n=" .. packet.n
                 .. (packet.Truncated and " [TRUNCATED]" or "")
+            lines[#lines + 1] = "  [9] equals script session at dispatch: " .. tostring(packet.ScriptSessionMatch or "unavailable")
             for i = 1, math.min(packet.n, 16) do
                 -- 会话凭据仅在本地比较，不把完整 token 复制到报告。
                 lines[#lines + 1] = "  [" .. i .. "] " .. (i == 9 and (typeof(packet[i]) .. "(<redacted>)")
@@ -13436,18 +13495,40 @@ function app.buildDamageCaptureReport()
             end
         end
     end
-    local native, rage = capture.Samples.Native, capture.Samples.RageBot
-    if native and rage and #native > 0 and #rage > 0 then
-        native, rage = native[#native], rage[#rage]
-        lines[#lines + 1] = "Latest sample comparison (different shots/targets may legitimately differ):"
-        lines[#lines + 1] = "  argument count equal: " .. tostring(native.n == rage.n)
-        for _, i in ipairs({1, 2, 5, 6, 9}) do
-            local same = native[i] == rage[i]
-            if i == 5 or i == 6 then same = app.sameDamageValue(native[i], rage[i]) end
-            lines[#lines + 1] = "  [" .. i .. "] equal: " .. ((native.Truncated or rage.Truncated) and "unknown (truncated)" or tostring(same))
+    local rage = capture.Samples.RageBot
+    local compared = false
+    if rage and #rage > 0 then
+        for _, observedSource in ipairs({"Native", "Unclassified"}) do
+            local observed = capture.Samples[observedSource]
+            local left, right
+            -- 优先比较同一工具、同一会话的实际样本，避免跨重生的最后一条误配。
+            for i = #(observed or {}), 1, -1 do
+                for j = #rage, 1, -1 do
+                    if observed[i][1] == rage[j][1] and type(observed[i][9]) == "string"
+                        and observed[i][9] == rage[j][9] then
+                        left, right = observed[i], rage[j]
+                        break
+                    end
+                end
+                if left then break end
+            end
+            if observed and #observed > 0 then
+                local matched = left ~= nil
+                left, right = left or observed[#observed], right or rage[#rage]
+                compared = true
+                lines[#lines + 1] = observedSource .. "/RageBot comparison: same Tool/session pair=" .. tostring(matched)
+                    .. (observedSource == "Unclassified" and " (caller unknown; not proof of native origin)" or "")
+                lines[#lines + 1] = "  argument count equal: " .. tostring(left.n == right.n)
+                for _, i in ipairs({1, 2, 5, 6, 9}) do
+                    local same = left[i] == right[i]
+                    if i == 5 or i == 6 then same = app.sameDamageValue(left[i], right[i]) end
+                    lines[#lines + 1] = "  [" .. i .. "] equal: " .. ((left.Truncated or right.Truncated) and "unknown (truncated)" or tostring(same))
+                end
+            end
         end
-    else
-        lines[#lines + 1] = "Native/RageBot pair incomplete: absence of a sample does not prove server rejection."
+    end
+    if not compared then
+        lines[#lines + 1] = "Damage pair incomplete: check window counts, expiry and capture errors; absence is not server rejection."
     end
     return table.concat(lines, "\n")
 end
@@ -14499,7 +14580,7 @@ function app.sendDamage(args, sourceKind)
         if not current() then return app.blockDamage("Damage context changed before sending") end
         dispatched = true
         app.damageStatus.Sent += 1
-        if app.damageCapture then pcall(app.captureDamagePacket, sourceKind or "Script", args) end
+        if app.damageCapture then app.tryCaptureDamagePacket(sourceKind or "Script", args) end
         if isDamageFunction then return Damage:InvokeServer(table.unpack(args, 1, args.n)) end
         Damage:FireServer(table.unpack(args, 1, args.n))
         return true
@@ -15556,12 +15637,11 @@ do
                     end
                 end
                 local callerOk, callingScript = pcall(getcallingscript)
-                if self == Damage and app.damageCapture and os.clock() <= app.damageCapture.Until
+                if self == Damage and app.damageCapture
                     and not app.damageSendThreads[coroutine.running()] then
-                    local nativeScript = env and (app.frameworkScripts[env] or rawget(env, "script"))
-                    local source = callerOk and callingScript ~= nil and callingScript == nativeScript and "Native" or "Unclassified"
+                    local source = app.classifyDamageCaller(callerOk, callingScript)
                     -- 复用已有监听；不读取 Instance 属性，不改参数或返回值，不安装额外 hook。
-                    pcall(app.captureDamagePacket, source, table.pack(select(2, ...)))
+                    app.tryCaptureDamagePacket(source, table.pack(select(2, ...)))
                 end
                 local triggerWindow = type(app.triggerFeedbackUntil) == "number"
                     and os.clock() <= app.triggerFeedbackUntil and app.triggerFeedbackTarget ~= nil
