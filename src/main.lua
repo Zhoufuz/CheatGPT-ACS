@@ -11068,9 +11068,7 @@ local rapidFireToggleControl = app.gateExecutorToggle(createModernToggle(localBo
     end
 end), "getsenv", "hookfunction", "newcclosure", "getcallingscript", "debug.getupvalues", "debug.setupvalue")
 
--- Infinite Ammo（不改表:弹匣弹药是 Shoot 函数的脚本级上值,射击时内联自减(v_u_8 = v_u_8 - 1),
--- 没有"减子弹函数"可 hook;改为每帧把弹匣上值钉回满弹——自减被即刻覆盖丢弃,效果等同 hook 丢弃返回空。
--- 弹药状态纯客户端维护(重装备回满的 bug 证明服务器不校验),钉客户端上值即可）
+-- Infinite Ammo：维护 Shoot 的弹匣上值；Rapid Fire 每次等待结束后同步补弹。
 local infiniteAmmoToggleControl = app.gateExecutorToggle(createModernToggle(localBody, "Infinite Ammo", infiniteAmmoEnabled, function(v)
     infiniteAmmoEnabled = v
     if v then
@@ -13803,7 +13801,7 @@ function app.refreshRapidCycleWaits()
                 local original = e.CycleWait
                 local wrapper = app.makeHookCClosure(original, function(...)
                     if not rapidFireEnabled then return original(...) end
-                    task.wait(60 / app.RAPID_FIRE_RATE)
+                    app.waitRapidFireCycle(task.wait, 60 / app.RAPID_FIRE_RATE)
                     return os.clock()
                 end)
                 if wrapper then
@@ -13865,14 +13863,15 @@ function app.syncRapidAmmoTables()
     end
 end
 
--- ===== Infinite Ammo:每帧把弹匣上值钉回满弹 =====
+-- ===== Infinite Ammo:逐帧维护 + Rapid Fire 每轮等待结束时补弹 =====
 -- 识别规则:优先使用 Settings/RepValues 中当前弹匣值作为评分基准，
 -- 再从 Shoot 的数字上值中选择落在弹容范围内且最接近当前弹匣的候选；
 -- 没有客户端弹匣读数时才退回捕获顺序，兼容三种 ACS 变体。
 app.infiniteAmmoCache = {} -- env -> {func=Shoot, idx=弹匣上值序号, settings=配置表(副本或原表)}
 
 function app.identifyInfiniteAmmo()
-    table.clear(app.infiniteAmmoCache)
+    local previous = app.infiniteAmmoCache
+    app.infiniteAmmoCache = {}
     for _, e in ipairs(app.collectFrameworkEnvs()) do
         if type(e.Shoot) == "function" then
             local upsS, source = app.readLuaUpvalues(e.Shoot)
@@ -13882,17 +13881,29 @@ function app.identifyInfiniteAmmo()
                     tonumber(rawget(settings, "Ammo")) or tonumber(rawget(settings, "MaxAmmo"))
                     or tonumber(rawget(settings, "MagazineSize"))
                 )
+                -- 自己钉满后，AmmoInGun/RepValues 可能仍是装备时或服务器上的旧值。
+                -- 同一 Lua 源函数与配置保持已确认的槽位，不能每次按旧值重新评分后改写备弹。
+                local prior = previous[e]
+                if prior and prior.func == source and prior.settings == settings
+                    and type(upsS[prior.idx]) == "number"
+                    and upsS[prior.idx] >= 0 and upsS[prior.idx] == upsS[prior.idx]
+                    and upsS[prior.idx] < math.huge then
+                    prior.magCap = magCap
+                    app.infiniteAmmoCache[e] = prior
+                    continue
+                end
                 local expected = settings and tonumber(rawget(settings, "AmmoInGun"))
                 local weapon = app.getCurrentWeapon and app.getCurrentWeapon()
                 local repValues = weapon and weapon:FindFirstChild("RepValues")
                 local repMag = repValues and repValues:FindFirstChild("Mag")
                 if repMag and type(repMag.Value) == "number" then expected = repMag.Value end
                 local bestIndex, bestScore
-                for i, up in ipairs(upsS) do
-                    if type(up) == "number" and up >= 0 and up == up
+                for i, up in pairs(upsS) do
+                    if type(i) == "number" and i >= 1 and i % 1 == 0
+                        and type(up) == "number" and up >= 0 and up == up
                         and (not magCap or up <= magCap + 1) then
                         local score = expected and math.abs(up - expected) or (up == 0 and 1000000 or i)
-                        if not bestScore or score < bestScore then
+                        if not bestScore or score < bestScore or (score == bestScore and i < bestIndex) then
                             bestIndex, bestScore = i, score
                         end
                     end
@@ -13917,6 +13928,16 @@ function app.pinInfiniteAmmo()
             app.writeLuaUpvalue(rec.func, rec.idx, jammed and 0 or (magCap + 1), "InfiniteAmmo")
         end, "InfiniteAmmo")
     end
+end
+
+-- 在原等待返回后、原版下一轮空弹匣判定前补弹，不依赖 Heartbeat 连接执行顺序。
+-- 仅由已通过 ACS 射速门控的调用使用；关闭无限弹药时保持原等待返回值。
+function app.waitRapidFireCycle(waitFunction, ...)
+    local results = table.pack(waitFunction(...))
+    if infiniteAmmoEnabled then
+        app.xpcallw(app.pinInfiniteAmmo, "InfiniteAmmo射击同步")
+    end
+    return table.unpack(results, 1, results.n)
 end
 
 -- ===== Instant Equip：在 hook 返回的原 Lua closure 上修改可行动标志 =====
@@ -14156,7 +14177,7 @@ function app.installRapidFireWaitHook()
     waitHook = app.makeHookCClosure(wait, function(...)
         local t = select(1, ...)
         if shouldAccelerate(t) then
-            return oldW(60 / app.RAPID_FIRE_RATE)
+            return app.waitRapidFireCycle(oldW, 60 / app.RAPID_FIRE_RATE)
         end
         return oldW(...)
     end)
@@ -14181,7 +14202,7 @@ function app.installRapidFireWaitHook()
     taskWaitHook = app.makeHookCClosure(task.wait, function(...)
         local t = select(1, ...)
         if shouldAccelerate(t) then
-            return oldTW(60 / app.RAPID_FIRE_RATE)
+            return app.waitRapidFireCycle(oldTW, 60 / app.RAPID_FIRE_RATE)
         end
         return oldTW(...)
     end)
@@ -15132,7 +15153,7 @@ RunService.Heartbeat:Connect(function()
         app.xpcallw(app.syncRapidAmmoTables, "RapidFire弹药同步")
     end
 
-    -- Infinite Ammo:每帧把弹匣上值钉回满弹(0.5s 重识别,覆盖换枪/重生后的新脚本实例)
+    -- Infinite Ammo:逐帧兜底；0.5s 刷新只在函数/配置变化时重新选择弹匣槽位
     if infiniteAmmoEnabled then
         app.xpcallw(app.pinInfiniteAmmo, "InfiniteAmmo")
         if os.clock() - (app.__lastInfAmmoIdentify or 0) > 0.5 then
