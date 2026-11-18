@@ -12961,6 +12961,7 @@ do
         end
         local status = app.steadyAimStatus or {}
         local damage = app.damageStatus or {}
+        local samples = app.damageCapture and app.damageCapture.Samples or {}
         local ready, waiting, busy = 0, 0, 0
         local failures = {}
         for _, item in pairs(app.imageBindings) do
@@ -12984,6 +12985,7 @@ do
             "Damage sent/rejected/errors/nil replies: " .. tostring(damage.Sent or 0) .. "/"
                 .. tostring(damage.Rejected or 0) .. "/" .. tostring(damage.Errors or 0) .. "/" .. tostring(damage.NilReplies or 0),
             "Last damage block: " .. tostring(damage.LastBlock or "None") .. " @ " .. tostring(damage.BlockedAt or 0),
+            "Damage samples native/RageBot: " .. #(samples.Native or {}) .. "/" .. #(samples.RageBot or {}),
         }
         for _, name in ipairs({"getconnections/getgc", "debug.getconstants", "debug.getupvalue", "debug.setupvalue", "hookfunction", "newcclosure"}) do
             if not app.EXEC_SUPPORT[name] then lines[#lines + 1] = "Steady Aim missing: " .. name end
@@ -13010,12 +13012,19 @@ do
     end)
     action("Copy diagnostics", 4, function()
         if type(setclipboard) ~= "function" then app.notifyUnsupportedFunc("setclipboard"); return end
-        setclipboard(app.buildDebugReport() .. "\n\nFull error ring:\n" .. table.concat(app.debugErrors, "\n"))
+        setclipboard(app.buildDebugReport() .. "\n\nFull error ring:\n" .. table.concat(app.debugErrors, "\n")
+            .. (app.buildDamageCaptureReport and ("\n\n" .. app.buildDamageCaptureReport()) or ""))
     end)
     action("Test notification / bug icon", 5, function()
         app.showNotification("Debug", "Notification and icon loading test", 5, {iconKey = "bug"})
     end)
     action("Clear error log", 6, function() table.clear(app.debugErrors); refresh() end)
+    action("Capture Damage (30s)", 7, function()
+        app.damageCapture = {Until = os.clock() + 30, Samples = {}, LastAt = {}}
+        app.showNotification("Debug", app.manualHookActive
+            and "30s capture: turn off RageBot and muzzle acceleration, land one manual hit, then enable RageBot with the same weapon. Copy diagnostics."
+            or "Native Damage capture unavailable: the existing namecall hook is inactive. Script-side sends can still be captured.", 10)
+    end)
     task.spawn(function()
         while gui.Parent do
             if app.DEBUG_UNLOCKED and app.activeTabName == "Debug" then refresh() end
@@ -13363,6 +13372,87 @@ end
 -- ========== ACS 环境初始化 ==========
 app.frameworkScripts = setmetatable({}, {__mode = "k"})
 app.damageStatus = {Sent = 0, Rejected = 0, Errors = 0, NilReplies = 0}
+app.damageSendThreads = setmetatable({}, {__mode = "k"})
+function app.snapshotDamageValue(value, depth, budget)
+    if type(value) ~= "table" then return value end
+    if depth >= 6 or budget.Left <= 0 then budget.Truncated = true; return "<truncated>" end
+    local copy = {}
+    for key, item in pairs(value) do
+        if budget.Left <= 0 then budget.Truncated = true; break end
+        if type(key) == "string" or type(key) == "number" then
+            budget.Left -= 1
+            copy[key] = app.snapshotDamageValue(item, depth + 1, budget)
+        else budget.Truncated = true end
+    end
+    return copy
+end
+
+function app.captureDamagePacket(source, args)
+    local capture = app.damageCapture
+    local now = os.clock()
+    if not capture or now > capture.Until then return end
+    local samples = capture.Samples[source] or {}
+    if #samples >= 3 or now - (capture.LastAt[source] or -math.huge) < 0.25 then return end
+    local budget, packet = {Left = 256}, {n = args.n, At = now}
+    for i = 1, math.min(args.n, 16) do packet[i] = app.snapshotDamageValue(args[i], 0, budget) end
+    packet.Truncated = budget.Truncated or args.n > 16
+    samples[#samples + 1] = packet
+    capture.Samples[source], capture.LastAt[source] = samples, now
+end
+
+function app.sameDamageValue(a, b)
+    if type(a) ~= type(b) then return false end
+    if type(a) ~= "table" then return a == b end
+    for key, value in pairs(a) do if not app.sameDamageValue(value, b[key]) then return false end end
+    for key in pairs(b) do if a[key] == nil then return false end end
+    return true
+end
+
+function app.formatDamageValue(value)
+    if typeof(value) == "Instance" then
+        local ok, path = pcall(function() return value:GetFullName() end)
+        return "Instance(" .. (ok and path or "unavailable") .. ")"
+    end
+    if type(value) ~= "table" then return typeof(value) .. "(" .. tostring(value) .. ")" end
+    local keys, parts = {}, {}
+    for key in pairs(value) do keys[#keys + 1] = key end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for _, key in ipairs(keys) do parts[#parts + 1] = tostring(key) .. "=" .. app.formatDamageValue(value[key]) end
+    return "{" .. table.concat(parts, ", ") .. "}"
+end
+
+function app.buildDamageCaptureReport()
+    local capture = app.damageCapture
+    if not capture then return "Damage capture: not started" end
+    local lines = {"Damage arguments at dispatch (up to 3 samples/source; instance paths resolved when copied):"}
+    for _, source in ipairs({"Native", "RageBot", "Accelerated", "Script", "Unclassified"}) do
+        local samples = capture.Samples[source] or {}
+        lines[#lines + 1] = source .. " samples: " .. #samples
+        for index, packet in ipairs(samples) do
+            lines[#lines + 1] = source .. " #" .. index .. " @ " .. packet.At .. " n=" .. packet.n
+                .. (packet.Truncated and " [TRUNCATED]" or "")
+            for i = 1, math.min(packet.n, 16) do
+                -- 会话凭据仅在本地比较，不把完整 token 复制到报告。
+                lines[#lines + 1] = "  [" .. i .. "] " .. (i == 9 and (typeof(packet[i]) .. "(<redacted>)")
+                    or app.formatDamageValue(packet[i]))
+            end
+        end
+    end
+    local native, rage = capture.Samples.Native, capture.Samples.RageBot
+    if native and rage and #native > 0 and #rage > 0 then
+        native, rage = native[#native], rage[#rage]
+        lines[#lines + 1] = "Latest sample comparison (different shots/targets may legitimately differ):"
+        lines[#lines + 1] = "  argument count equal: " .. tostring(native.n == rage.n)
+        for _, i in ipairs({1, 2, 5, 6, 9}) do
+            local same = native[i] == rage[i]
+            if i == 5 or i == 6 then same = app.sameDamageValue(native[i], rage[i]) end
+            lines[#lines + 1] = "  [" .. i .. "] equal: " .. ((native.Truncated or rage.Truncated) and "unknown (truncated)" or tostring(same))
+        end
+    else
+        lines[#lines + 1] = "Native/RageBot pair incomplete: absence of a sample does not prove server rejection."
+    end
+    return table.concat(lines, "\n")
+end
 function app.blockDamage(reason)
     app.damageStatus.LastBlock, app.damageStatus.BlockedAt = reason, os.clock()
     return false
@@ -14314,6 +14404,29 @@ function app.bindDamageContext(args, weapon, config, framework)
     return args
 end
 
+function app.getNativeShotOrigin(character, camera, muzzlePosition)
+    local head = character and character:FindFirstChild("Head")
+    local cameraPosition = camera and camera.CFrame.Position
+    if head and head:IsA("BasePart") then
+        if cameraPosition and (cameraPosition - head.Position).Magnitude < 3 then return cameraPosition end
+        return head.Position
+    end
+    return muzzlePosition
+end
+
+function app.correctRageHit(framework, hitPart, hitPos, direction)
+    if not hitPart or not hitPart.Parent then return nil end
+    if not app.isBallisticFramework(framework) or hitPart.Name ~= "Head" then return hitPos end
+    local ballistics = framework.Ballistics
+    if type(ballistics.HeadPoint) ~= "function" or type(ballistics.HumanoidOf) ~= "function" then return nil end
+    local ok, position = app.xpcallw(function()
+        if not ballistics.HumanoidOf(hitPart) then return hitPos end
+        -- 原版 HeadPoint 返回 nil 代表射线未进入实际头部命中区域，不发送包围盒上的假落点。
+        return ballistics.HeadPoint(hitPart, hitPos, direction)
+    end, "Rage命中坐标")
+    return ok and position or nil
+end
+
 function app.buildDamageArgs(weapon, humanoid, distance, zone, config, hitPart, hitPos, shotOrigin, shotDirection)
     local framework = env
     if not hitPart or not hitPart.Parent or not modTable or not accessId
@@ -14348,7 +14461,7 @@ function app.buildDamageArgs(weapon, humanoid, distance, zone, config, hitPart, 
     return app.bindDamageContext(args, weapon, config, framework)
 end
 
-function app.sendDamage(args)
+function app.sendDamage(args, sourceKind)
     if not args or not Damage then return false end
     local function current()
         return args.sourceCharacter == LocalPlayer.Character and args.sourceFramework == env
@@ -14357,15 +14470,20 @@ function app.sendDamage(args)
     if not current() then return app.blockDamage("Queued damage context expired") end
     -- Presentation metadata only; damage arguments and acceptance remain unchanged.
     if app.killEffect then pcall(app.killEffect.ObserveHit, args[2], args[1], args[4]) end
+    local thread = coroutine.running()
+    local previousSender = thread and app.damageSendThreads[thread]
+    if thread then app.damageSendThreads[thread] = true end
     local dispatched = false
     local ok, result = app.xpcallw(function()
         if not current() then return app.blockDamage("Damage context changed before sending") end
         dispatched = true
         app.damageStatus.Sent += 1
+        if app.damageCapture then pcall(app.captureDamagePacket, sourceKind or "Script", args) end
         if isDamageFunction then return Damage:InvokeServer(table.unpack(args, 1, args.n)) end
         Damage:FireServer(table.unpack(args, 1, args.n))
         return true
     end, "Damage")
+    if thread then app.damageSendThreads[thread] = previousSender end
     if not ok then app.damageStatus.Errors += 1
     elseif dispatched and result == false then app.damageStatus.Rejected += 1
     elseif dispatched and result == nil then app.damageStatus.NilReplies += 1 end
@@ -14641,7 +14759,7 @@ function app.doInstantHit(part, showTrace, launchOrigin, launchDirection, camera
         local targetPlayer = Players:GetPlayerFromCharacter(model)
         local cancelWatch = targetPlayer and createDamageWatch(targetPlayer, hitPart.Name, distance, zone == 1) or function() end
         local args = app.buildDamageArgs(weapon, humanoid, distance, zone, weaponConfig, hitPart, hitPos, shotOrigin, direction)
-        local success = app.sendDamage(args)
+        local success = app.sendDamage(args, "Accelerated")
         if success then
             app.playHitsound()
             app.showHitmarker(args[4] == 1, hitPos, hitPart)
@@ -15268,6 +15386,7 @@ if environmentLoaded then
         local weaponConfig = app.rageWeaponConfigRef
         if not app.isDamagePayloadReady(weapon, weaponConfig, env) then return end
         local shotOrigin = Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.Position or origin
+        if app.isBallisticFramework(env) then shotOrigin = app.getNativeShotOrigin(char, Workspace.CurrentCamera, origin) end
         local maxTargets = math.min(app.RAGE_MULTI_TARGET, #app.rageTargets)
         local threadCount = math.max(1, app.RAGE_THREADS_PER_TARGET) -- 无论如何不能小于 1
 
@@ -15289,9 +15408,12 @@ if environmentLoaded then
                     if t.player and t.player.Character and app.isAlive(t.player) and Damage then
                         local direction = t.hitPos - origin
                         if direction.Magnitude > 0 then
-                            local args = app.buildDamageArgs(weapon, t.humanoid, t.distance, t.hitZone, weaponConfig,
-                                t.hitPart, t.hitPos, shotOrigin, direction.Unit)
-                            success = app.sendDamage(args)
+                            local hitPos = app.correctRageHit(env, t.hitPart, t.hitPos, direction.Unit)
+                            if hitPos then
+                                local args = app.buildDamageArgs(weapon, t.humanoid, t.distance, t.hitZone, weaponConfig,
+                                    t.hitPart, hitPos, shotOrigin, direction.Unit)
+                                success = app.sendDamage(args, "RageBot")
+                            end
                         end
                     end
                     app.ragePending -= 1
@@ -15413,6 +15535,13 @@ do
                     end
                 end
                 local callerOk, callingScript = pcall(getcallingscript)
+                if self == Damage and app.damageCapture and os.clock() <= app.damageCapture.Until
+                    and not app.damageSendThreads[coroutine.running()] then
+                    local nativeScript = env and (app.frameworkScripts[env] or rawget(env, "script"))
+                    local source = callerOk and callingScript ~= nil and callingScript == nativeScript and "Native" or "Unclassified"
+                    -- 复用已有监听；不读取 Instance 属性，不改参数或返回值，不安装额外 hook。
+                    pcall(app.captureDamagePacket, source, table.pack(select(2, ...)))
+                end
                 local triggerWindow = type(app.triggerFeedbackUntil) == "number"
                     and os.clock() <= app.triggerFeedbackUntil and app.triggerFeedbackTarget ~= nil
                 -- 手动 ACS 调用优先使用 calling script；Trigger 的原生手机/电脑入口可能异步发送
